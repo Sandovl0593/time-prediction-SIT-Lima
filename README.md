@@ -30,17 +30,8 @@ Predicción de tiempos de viaje en la red de Sistema Integrado de Transporte de 
 │       ├── metrics.py           # MSE, RMSE, MAE, MAPE, R², estadísticas
 │       └── seed.py
 └── tests/
-    └── test_pipeline.py
+    └── test_compare.py
 ```
-
-## Datos Mock
-
-Grafo dirigido multimodal con ~96 nodos y ~200 aristas simulando:
-- **9 líneas ferroviarias** (Línea 1-9)
-- **2 rutas BRT** (buses de alta capacidad)
-- **2 alimentadores** (buses de media capacidad)
-- **3 corredores complementarios**
-- **15 estaciones de transferencia** entre líneas
 
 ## Uso
 
@@ -56,12 +47,8 @@ python run.py --model graphsage_gru --epochs 50
 
 # Personalizar hiperparámetros
 python run.py --model gcn --hidden_dim 128 --num_layers 3 --lr 0.0005
-
-# Ejecutar tests
-python -m pytest tests/ -v
 ```
 
 ## Métricas
 
 - MSE, RMSE, MAE, MAPE (%), R²
-- Estadísticas descriptivas: media, mediana, std, percentiles (P25, P75, P90)

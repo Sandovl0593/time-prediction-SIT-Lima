@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from src.config import Config
-from src.data.mock_lima_graph import create_lima_mock_graph
+from src.data.mock_lima_tensor import mock_lima_graph
 from src.models.gcn_model import TravelTimeGCN
 from src.models.graphsage_model import TravelTimeGraphSAGE
 from src.models.gru_model import TravelTimeGCN_GRU, TravelTimeGraphSAGE_GRU
@@ -149,7 +149,7 @@ def train_and_evaluate(config: Config) -> Dict:
 
     # ----- Datos -----
     logger.info("Generando grafo mock de Lima...")
-    data, metadata = create_lima_mock_graph(
+    data, metadata = mock_lima_graph(
         seed=config.seed,
         num_time_steps=config.num_time_steps,
     )
