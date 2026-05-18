@@ -18,7 +18,6 @@ import math
 from typing import Dict, List, Tuple
 
 import numpy as np
-import torch
 from torch_geometric.data import Data
 
 

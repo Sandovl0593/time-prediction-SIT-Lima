@@ -115,49 +115,49 @@ class _GraphGRUBase(nn.Module):
         return self.decoder(edge_features).squeeze(-1)
 
 
-class TravelTimeGCN_GRU(_GraphGRUBase):
-    """Modelo híbrido GCN + GRU.
+# class TravelTimeGCN_GRU(_GraphGRUBase):
+#     """Modelo híbrido GCN + GRU.
 
-    - GCN encoder captura la estructura espacial del grafo.
-    - GRU captura patrones temporales (variación horaria de demanda/congestión).
-    """
+#     - GCN encoder captura la estructura espacial del grafo.
+#     - GRU captura patrones temporales (variación horaria de demanda/congestión).
+#     """
 
-    def _build_graph_encoder(self, in_channels, hidden_dim, num_layers, dropout):
-        self.graph_encoder = GCN(
-            in_channels=in_channels,
-            hidden_channels=hidden_dim,
-            num_layers=num_layers,
-            out_channels=hidden_dim,
-            dropout=dropout,
-        )
+#     def _build_graph_encoder(self, in_channels, hidden_dim, num_layers, dropout):
+#         self.graph_encoder = GCN(
+#             in_channels=in_channels,
+#             hidden_channels=hidden_dim,
+#             num_layers=num_layers,
+#             out_channels=hidden_dim,
+#             dropout=dropout,
+#         )
 
-    def _graph_encode(self, x, edge_index):
-        return self.graph_encoder(x, edge_index)
+#     def _graph_encode(self, x, edge_index):
+#         return self.graph_encoder(x, edge_index)
 
 
-class TravelTimeGraphSAGE_GRU(_GraphGRUBase):
-    """Modelo híbrido GraphSAGE + GRU.
+# class TravelTimeGraphSAGE_GRU(_GraphGRUBase):
+#     """Modelo híbrido GraphSAGE + GRU.
 
-    - GraphSAGE encoder con SAGEConv captura la estructura espacial.
-    - GRU captura patrones temporales.
-    """
+#     - GraphSAGE encoder con SAGEConv captura la estructura espacial.
+#     - GRU captura patrones temporales.
+#     """
 
-    def _build_graph_encoder(self, in_channels, hidden_dim, num_layers, dropout):
-        self.sage_convs = nn.ModuleList()
-        self.sage_norms = nn.ModuleList()
+#     def _build_graph_encoder(self, in_channels, hidden_dim, num_layers, dropout):
+#         self.sage_convs = nn.ModuleList()
+#         self.sage_norms = nn.ModuleList()
 
-        self.sage_convs.append(SAGEConv(in_channels, hidden_dim))
-        self.sage_norms.append(nn.BatchNorm1d(hidden_dim))
+#         self.sage_convs.append(SAGEConv(in_channels, hidden_dim))
+#         self.sage_norms.append(nn.BatchNorm1d(hidden_dim))
 
-        for _ in range(num_layers - 1):
-            self.sage_convs.append(SAGEConv(hidden_dim, hidden_dim))
-            self.sage_norms.append(nn.BatchNorm1d(hidden_dim))
+#         for _ in range(num_layers - 1):
+#             self.sage_convs.append(SAGEConv(hidden_dim, hidden_dim))
+#             self.sage_norms.append(nn.BatchNorm1d(hidden_dim))
 
-    def _graph_encode(self, x, edge_index):
-        for i, (conv, norm) in enumerate(zip(self.sage_convs, self.sage_norms)):
-            x = conv(x, edge_index)
-            x = norm(x)
-            x = F.relu(x)
-            if i < len(self.sage_convs) - 1:
-                x = F.dropout(x, p=self.dropout, training=self.training)
-        return x
+#     def _graph_encode(self, x, edge_index):
+#         for i, (conv, norm) in enumerate(zip(self.sage_convs, self.sage_norms)):
+#             x = conv(x, edge_index)
+#             x = norm(x)
+#             x = F.relu(x)
+#             if i < len(self.sage_convs) - 1:
+#                 x = F.dropout(x, p=self.dropout, training=self.training)
+#         return x

@@ -10,9 +10,11 @@ class Config:
 
     Attributes:
         model: Nombre del modelo a entrenar.
-            Opciones: 'gcn', 'graphsage', 'gcn_gru', 'graphsage_gru'
+            Opciones: 'gcn', 'graphsage', 'gat', 'gatv2',
+                      'gcn_gru', 'graphsage_gru', 'gat_gru', 'gatv2_gru'
         hidden_dim: Dimensión de las capas ocultas.
         num_layers: Número de capas del encoder de grafos.
+        heads: Número de heads de atención (solo para GAT/GATv2).
         gru_hidden_dim: Dimensión oculta del GRU (solo para modelos híbridos).
         gru_num_layers: Número de capas GRU (solo para modelos híbridos).
         dropout: Tasa de dropout.
@@ -28,6 +30,7 @@ class Config:
     model: str = "gcn"
     hidden_dim: int = 64
     num_layers: int = 2
+    heads: int = 4
     gru_hidden_dim: int = 64
     gru_num_layers: int = 1
     dropout: float = 0.1
@@ -39,7 +42,10 @@ class Config:
     num_time_steps: int = 12
     device: str = "cpu"
 
-    VALID_MODELS = ("gcn", "graphsage", "gcn_gru", "graphsage_gru")
+    VALID_MODELS = (
+        "gcn", "graphsage", "gat", "gatv2",
+        "gcn_gru", "graphsage_gru", "gat_gru", "gatv2_gru",
+    )
 
     def __post_init__(self):
         if self.model not in self.VALID_MODELS:

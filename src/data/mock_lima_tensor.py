@@ -364,19 +364,19 @@ def mock_lima_graph(
     # Paso 5: Features temporales
     # =================================================================
     x_static = np.array(node_features_list, dtype=np.float32)
-    x_temporal = np.zeros(
-        (num_nodes, num_time_steps, x_static.shape[1]), dtype=np.float32
-    )
+    # x_temporal = np.zeros(
+    #     (num_nodes, num_time_steps, x_static.shape[1]), dtype=np.float32
+    # )
 
-    for t in range(num_time_steps):
-        hour_factor = 0.5 + 0.5 * math.sin(2 * math.pi * t / num_time_steps)
-        for n in range(num_nodes):
-            temporal_feat = x_static[n].copy()
-            temporal_feat[6] *= (0.3 + 0.7 * hour_factor + rng.normal(0, 0.05))
-            temporal_feat[7] *= (0.5 + 0.5 * hour_factor + rng.normal(0, 0.03))
-            x_temporal[n, t] = temporal_feat
+    # for t in range(num_time_steps):
+    #     hour_factor = 0.5 + 0.5 * math.sin(2 * math.pi * t / num_time_steps)
+    #     for n in range(num_nodes):
+    #         temporal_feat = x_static[n].copy()
+    #         temporal_feat[6] *= (0.3 + 0.7 * hour_factor + rng.normal(0, 0.05))
+    #         temporal_feat[7] *= (0.5 + 0.5 * hour_factor + rng.normal(0, 0.03))
+    #         x_temporal[n, t] = temporal_feat
 
-    print("Status Mock: Features temporales generados")
+    # print("Status Mock: Features temporales generados")
 
     # =================================================================
     # Paso 6: Train/test split
@@ -421,7 +421,7 @@ def mock_lima_graph(
         test_mask=torch.tensor(test_mask, dtype=torch.bool),
         num_nodes=num_nodes,
     )
-    data.x_temporal = torch.tensor(x_temporal, dtype=torch.float32)
+    # data.x_temporal = torch.tensor(x_temporal, dtype=torch.float32)
     data.node_typ = torch.tensor(node_types, dtype=torch.long)
     data.node_line = torch.tensor(node_lines_list, dtype=torch.long)
 

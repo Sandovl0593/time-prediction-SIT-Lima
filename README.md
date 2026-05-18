@@ -30,7 +30,7 @@ Predicción de tiempos de viaje en la red de Sistema Integrado de Transporte de 
 │       ├── metrics.py           # MSE, RMSE, MAE, MAPE, R², estadísticas
 │       └── seed.py
 └── tests/
-    └── test_compare.py
+    └── compare_models.py
 ```
 
 ## Uso

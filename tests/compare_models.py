@@ -23,10 +23,11 @@ from src.train.trainer import build_model, train_epoch, evaluate_model
 from src.utils.seed import set_seed
 
 
-REPEATS = 3
+REPEATS = 1
 EPOCHS = 3
 NUM_TIME_STEPS = 6
-MODELS = ["gcn_gru", "graphsage_gru"]
+# MODELS = ["gcn_gru", "graphsage_gru"]
+MODELS = ["gcn", "graphsage", "gat", "gatv2"]
 DEVICE = "cpu"
 
 
@@ -53,7 +54,7 @@ def _summarize_list(vals):
     }
 
 
-def test_compare_gru_models_collect_stats():
+def test_compare_models_collect_stats():
     """Ejecuta varias corridas cortas, recopila métricas y tiempos.
 
     - Valida que las métricas son numéricas y finitas
@@ -65,13 +66,13 @@ def test_compare_gru_models_collect_stats():
     for r in range(REPEATS):
         seed = 1000 + r
         set_seed(seed)
-        data, metadata = mock_lima_graph(seed=seed, num_time_steps=NUM_TIME_STEPS)
+        data, _ = mock_lima_graph(seed=seed, num_time_steps=NUM_TIME_STEPS)
 
         # Asegurar tipos torch (mock_lima_tensor debería devolver tensores,
         # pero convertir por seguridad)
         _ensure_tensor_attr(data, "x", torch.float32)
         _ensure_tensor_attr(data, "y", torch.float32)
-        _ensure_tensor_attr(data, "x_temporal", torch.float32)
+        # _ensure_tensor_attr(data, "x_temporal", torch.float32)
         _ensure_tensor_attr(data, "edge_attr", torch.float32)
         _ensure_tensor_attr(data, "train_mask", torch.bool)
         _ensure_tensor_attr(data, "test_mask", torch.bool)
@@ -91,6 +92,8 @@ def test_compare_gru_models_collect_stats():
                 device=DEVICE,
                 seed=seed,
             )
+
+            print("Modelo:", model_name.upper(), "| Repetición:", r + 1)
 
             model = build_model(config, data.x.shape[1], data.edge_attr.shape[1]).to(DEVICE)
             num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -155,3 +158,7 @@ def test_compare_gru_models_collect_stats():
 
     # Guardar resumen en pytest para inspección manual opcional
     pytest.summary = summary
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])

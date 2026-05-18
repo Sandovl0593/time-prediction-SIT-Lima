@@ -6,6 +6,7 @@ Uso:
     python run.py --model gcn_gru --epochs 50
     python run.py --model graphsage_gru --epochs 50
     python run.py --model gcn --hidden_dim 128 --num_layers 3
+    python run.py --test
 """
 
 import argparse
@@ -13,6 +14,8 @@ import sys
 
 from src.config import Config
 from src.train.trainer import train_and_evaluate
+from tests.compare_models import test_compare_models_collect_stats
+
 
 
 def parse_args():
@@ -28,6 +31,7 @@ def parse_args():
         choices=Config.VALID_MODELS,
         help="Modelo a entrenar",
     )
+    parser.add_argument("--test", action="store_true", help="Ejecutar pruebas de comparación de modelos")
     parser.add_argument("--hidden_dim", type=int, default=None, help="Dimensión oculta")
     parser.add_argument("--num_layers", type=int, default=None, help="Capas del encoder de grafos")
     parser.add_argument("--gru_hidden_dim", type=int, default=None, help="Dimensión oculta del GRU")
@@ -53,6 +57,10 @@ def main():
     args = parse_args()
 
     # Construir config, solo sobrescribir valores explícitos
+    if args.test:
+        test_compare_models_collect_stats()
+        return 0
+    
     config_kwargs = {"model": args.model}
     for key in [
         "hidden_dim", "num_layers", "gru_hidden_dim", "gru_num_layers",
