@@ -10,8 +10,7 @@ class Config:
 
     Attributes:
         model: Nombre del modelo a entrenar.
-            Opciones: 'gcn', 'graphsage', 'gat', 'gatv2',
-                      'gcn_gru', 'graphsage_gru', 'gat_gru', 'gatv2_gru'
+            Opciones: 'gat', 'gatv2', 'graphsage'
         hidden_dim: Dimensión de las capas ocultas.
         num_layers: Número de capas del encoder de grafos.
         heads: Número de heads de atención (solo para GAT/GATv2).
@@ -27,7 +26,7 @@ class Config:
         device: Dispositivo de cómputo ('cpu' o 'cuda').
     """
 
-    model: str = "gcn"
+    model: str = "gat"
     hidden_dim: int = 64
     num_layers: int = 2
     heads: int = 4
@@ -42,9 +41,9 @@ class Config:
     num_time_steps: int = 12
     device: str = "cpu"
 
+    # Limitado a los tres encoders que vamos a considerar.
     VALID_MODELS = (
-        "gcn", "graphsage", "gat", "gatv2",
-        "gcn_gru", "graphsage_gru", "gat_gru", "gatv2_gru",
+        "gat", "gatv2", "graphsage",
     )
 
     def __post_init__(self):

@@ -20,7 +20,7 @@ Archivos: stations_aliment_Metrop.csv, stations_corredor_azul.csv, stations_corr
 
 Campos:
 - `paradero`: `string`. Nombre del paradero.
-- `corredor`: `string`. Nombre (para alimentador) o número (para corredor) del bus.
+- `corredor`: `string`. Código del bus alimnetador o corredor.
 - `ida`: `boolean`. Si es parte de la recorrido de ida.
 - `vuelta`: `boolean`. Si es parte de la recorrido de vuelta.
 - `coordenadas`: `string`, par (lat,lon) en grados decimales.

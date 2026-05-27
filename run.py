@@ -6,15 +6,20 @@ Uso:
     python run.py --model gcn_gru --epochs 50
     python run.py --model graphsage_gru --epochs 50
     python run.py --model gcn --hidden_dim 128 --num_layers 3
+    python run.py --model gat --epochs 50
+    python run.py --model gatv2 --epochs 50
+    python run.py --model gat --hidden_dim 128 --num_layers 3
     python run.py --test
 """
 
 import argparse
 import sys
+import os
+
+from src.data.load_nyc_mta import load_nyc_mta, load_processed_gdfs, visualize_nodes_edges
 
 from src.config import Config
 from src.train.trainer import train_and_evaluate
-from tests.compare_models import test_compare_models_collect_stats
 
 
 
@@ -27,11 +32,11 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        default="gcn",
+           default="gat",
         choices=Config.VALID_MODELS,
         help="Modelo a entrenar",
     )
-    parser.add_argument("--test", action="store_true", help="Ejecutar pruebas de comparación de modelos")
+    parser.add_argument("--process-nyc", action="store_true", help="Procesar datos RAW de NYC y guardar en processed/")
     parser.add_argument("--hidden_dim", type=int, default=None, help="Dimensión oculta")
     parser.add_argument("--num_layers", type=int, default=None, help="Capas del encoder de grafos")
     parser.add_argument("--gru_hidden_dim", type=int, default=None, help="Dimensión oculta del GRU")
@@ -57,10 +62,6 @@ def main():
     args = parse_args()
 
     # Construir config, solo sobrescribir valores explícitos
-    if args.test:
-        test_compare_models_collect_stats()
-        return 0
-    
     config_kwargs = {"model": args.model}
     for key in [
         "hidden_dim", "num_layers", "gru_hidden_dim", "gru_num_layers",
@@ -72,6 +73,30 @@ def main():
             config_kwargs[key] = val
 
     config = Config(**config_kwargs)
+
+    # Si se solicita procesar los datos raw de NYC, ejecutar el pipeline y terminar
+    if args.process_nyc:
+        base = os.path.join("src", "data")
+        base_raw = os.path.join(base, "rawNYC")
+        stations = os.path.join(base_raw, "MTA_Subway_Stations.csv")
+        stop_times = os.path.join(base_raw, "stop_times.csv")
+        trips = os.path.join(base_raw, "trip_times.csv")
+
+        path_processed = os.path.join(base, "processed")
+
+        print("[run.py] Processing raw NYC data and saving processed CSVs...")
+        
+        processed_dir = os.path.join(base, "processed")
+        if not os.path.exists(path_processed):
+            load_nyc_mta(stations, stop_times_path=stop_times, trips_path=trips)
+            # print(f"[run.py] Processed files saved to: {processed_dir}")
+
+        print("[run.py] Loading processed CSVs for visualization...")
+        gdf_nodes, gdf_lines = load_processed_gdfs(processed_dir)
+
+        print("[run.py] Visualizing processed data (loaded from CSV)...")
+        visualize_nodes_edges(gdf_nodes, gdf_lines, show_labels=False, node_size=15, edge_color="black")
+        return 0
 
     print(f"\n{'='*60}")
     print(f"  Predicción de Tiempos de Viaje — Lima Transport Network")

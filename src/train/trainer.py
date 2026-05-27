@@ -25,9 +25,8 @@ from src.models.gat_model import TravelTimeGAT
 from src.models.gatv2_model import TravelTimeGATv2
 # from src.models.gru_model import TravelTimeGCN_GRU, TravelTimeGraphSAGE_GRU
 from src.models.gat_gru_model import TravelTimeGAT_GRU, TravelTimeGATv2_GRU
-from src.utils.logging import get_logger
+from src.utils.others import get_logger, set_seed
 from src.utils.metrics import compute_all_metrics, travel_time_stats
-from src.utils.seed import set_seed
 
 
 logger = get_logger("trainer")

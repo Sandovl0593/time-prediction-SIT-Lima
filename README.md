@@ -1,15 +1,18 @@
-# time-prediction-GCN-Lima
+# time-prediction-SIT-Lima
 
 Predicción de tiempos de viaje en la red de Sistema Integrado de Transporte de Lima (SIT) usando modelos basados en grafos y secuencias temporales.
 
 ## Modelos
 
+Este repositorio considera los siguientes encoders espaciales. Todos los
+modelos incluyen un decoder MLP a nivel de arista (entrada: `z_src || z_dst || edge_attr` → salida escalar),
+listo para tareas de regresión de tiempo de viaje.
+
 | Modelo | Descripción | Tipo |
 |--------|-------------|------|
-| `gcn` | GCN puro (`torch_geometric.nn.models.GCN`) | Espacial |
-| `graphsage` | GraphSAGE con `SAGEConv` + BatchNorm | Espacial |
-| `gcn_gru` | GCN encoder + GRU temporal | Espacio-temporal |
-| `graphsage_gru` | GraphSAGE encoder + GRU temporal | Espacio-temporal |
+| `gat` | Graph Attention Network (GAT) encoder + edge-level MLP decoder | Espacial |
+| `gatv2` | GATv2 encoder + edge-level MLP decoder | Espacial |
+| `graphsage` | GraphSAGE encoder + edge-level MLP decoder | Espacial |
 
 ## Estructura
 
@@ -18,19 +21,19 @@ Predicción de tiempos de viaje en la red de Sistema Integrado de Transporte de 
 ├── src/
 │   ├── config.py            # Configuración centralizada
 │   ├── data/
-│   │   └── mock_lima_graph.py   # Grafo mock multimodal de Lima
+│   │   ├── mock_lima_graph.py   # Grafo mock multimodal de Lima
+│   │   └── load_nyc_mta.py      # Loader GeoPandas -> NetworkX para NYC MTA
 │   ├── models/
-│   │   ├── gcn_model.py
+│   │   ├── gat_model.py
+│   │   ├── gatv2_model.py
 │   │   ├── graphsage_model.py
-│   │   └── gru_model.py        # Híbridos GCN+GRU y GraphSAGE+GRU
+│   │   └── gru_model.py        # (opcional) Híbridos con GRU
 │   ├── train/
 │   │   └── trainer.py           # Pipeline de entrenamiento
 │   └── utils/
 │       ├── logging.py
 │       ├── metrics.py           # MSE, RMSE, MAE, MAPE, R², estadísticas
 │       └── seed.py
-└── tests/
-    └── compare_models.py
 ```
 
 ## Uso
@@ -40,13 +43,12 @@ Predicción de tiempos de viaje en la red de Sistema Integrado de Transporte de 
 pip install -r requirements.txt
 
 # Entrenar un modelo
-python run.py --model gcn --epochs 50
+python run.py --model gat --epochs 50
+python run.py --model gatv2 --epochs 50
 python run.py --model graphsage --epochs 50
-python run.py --model gcn_gru --epochs 50
-python run.py --model graphsage_gru --epochs 50
 
 # Personalizar hiperparámetros
-python run.py --model gcn --hidden_dim 128 --num_layers 3 --lr 0.0005
+python run.py --model gat --hidden_dim 128 --num_layers 3 --lr 0.0005
 ```
 
 ## Métricas
