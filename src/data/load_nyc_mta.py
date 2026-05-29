@@ -460,14 +460,7 @@ if __name__ == "__main__":
     stations = os.path.join(base, "MTA_Subway_Stations.csv")
     stop_times = os.path.join(base, "stop_times.csv")
     trips = os.path.join(base, "trip_times.csv")
-    data = load_nyc_mta(stations, stop_times_path=stop_times, trips_path=trips)
-    G = data["graph"]
-    gdf_nodes = data["gdf_nodes"]
-    gdf_lines = data["gdf_lines"]
+    
+    load_nyc_mta(stations, stop_times_path=stop_times, trips_path=trips)
 
-    print(f"Nodos: {G.number_of_nodes()}, Aristas: {G.number_of_edges()}")
-    print(gdf_nodes.head())
-    print(gdf_lines.head())
-
-    ax = visualize_nodes_edges(gdf_nodes, gdf_lines, node_size=20, edge_color="lightgray")
-    plt.show()
+    
