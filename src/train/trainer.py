@@ -5,10 +5,6 @@ Soporta 8 modelos:
 - graphsage: GraphSAGE puro (estático)
 - gat: GAT con multi-head attention (estático)
 - gatv2: GATv2 con atención dinámica (estático)
-- gcn_gru: GCN + GRU (espacio-temporal)
-- graphsage_gru: GraphSAGE + GRU (espacio-temporal)
-- gat_gru: GAT + GRU (espacio-temporal)
-- gatv2_gru: GATv2 + GRU (espacio-temporal)
 """
 
 import time
@@ -19,12 +15,9 @@ import torch.nn as nn
 
 from src.config import Config
 from src.data.mock_lima_tensor import mock_lima_graph
-from src.models.gcn_model import TravelTimeGCN
 from src.models.graphsage_model import TravelTimeGraphSAGE
 from src.models.gat_model import TravelTimeGAT
 from src.models.gatv2_model import TravelTimeGATv2
-# from src.models.gru_model import TravelTimeGCN_GRU, TravelTimeGraphSAGE_GRU
-from src.models.gat_gru_model import TravelTimeGAT_GRU, TravelTimeGATv2_GRU
 from src.utils.others import get_logger, set_seed
 from src.utils.metrics import compute_all_metrics, travel_time_stats
 
@@ -43,15 +36,7 @@ def build_model(config: Config, in_channels: int, edge_attr_dim: int) -> nn.Modu
     Returns:
         Modelo instanciado.
     """
-    if config.model == "gcn":
-        return TravelTimeGCN(
-            in_channels=in_channels,
-            hidden_dim=config.hidden_dim,
-            num_layers=config.num_layers,
-            edge_attr_dim=edge_attr_dim,
-            dropout=config.dropout,
-        )
-    elif config.model == "graphsage":
+    if config.model == "graphsage":
         return TravelTimeGraphSAGE(
             in_channels=in_channels,
             hidden_dim=config.hidden_dim,
@@ -74,48 +59,6 @@ def build_model(config: Config, in_channels: int, edge_attr_dim: int) -> nn.Modu
             hidden_dim=config.hidden_dim,
             num_layers=config.num_layers,
             heads=config.heads,
-            edge_attr_dim=edge_attr_dim,
-            dropout=config.dropout,
-        )
-    # elif config.model == "gcn_gru":
-    #     return TravelTimeGCN_GRU(
-    #         in_channels=in_channels,
-    #         graph_hidden_dim=config.hidden_dim,
-    #         graph_num_layers=config.num_layers,
-    #         gru_hidden_dim=config.gru_hidden_dim,
-    #         gru_num_layers=config.gru_num_layers,
-    #         edge_attr_dim=edge_attr_dim,
-    #         dropout=config.dropout,
-    #     )
-    # elif config.model == "graphsage_gru":
-    #     return TravelTimeGraphSAGE_GRU(
-    #         in_channels=in_channels,
-    #         graph_hidden_dim=config.hidden_dim,
-    #         graph_num_layers=config.num_layers,
-    #         gru_hidden_dim=config.gru_hidden_dim,
-    #         gru_num_layers=config.gru_num_layers,
-    #         edge_attr_dim=edge_attr_dim,
-    #         dropout=config.dropout,
-    #     )
-    elif config.model == "gat_gru":
-        return TravelTimeGAT_GRU(
-            in_channels=in_channels,
-            graph_hidden_dim=config.hidden_dim,
-            graph_num_layers=config.num_layers,
-            heads=config.heads,
-            gru_hidden_dim=config.gru_hidden_dim,
-            gru_num_layers=config.gru_num_layers,
-            edge_attr_dim=edge_attr_dim,
-            dropout=config.dropout,
-        )
-    elif config.model == "gatv2_gru":
-        return TravelTimeGATv2_GRU(
-            in_channels=in_channels,
-            graph_hidden_dim=config.hidden_dim,
-            graph_num_layers=config.num_layers,
-            heads=config.heads,
-            gru_hidden_dim=config.gru_hidden_dim,
-            gru_num_layers=config.gru_num_layers,
             edge_attr_dim=edge_attr_dim,
             dropout=config.dropout,
         )
