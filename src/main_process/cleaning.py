@@ -23,7 +23,18 @@ import pandas as pd
 import numpy as np
 import geopandas as gpd
 from shapely import wkt
-from shapely.geometry import Point
+from shapely.geometry import Point, LineString
+from datetime import datetime
+import logging
+
+# configurar logger simple para información durante el preprocesado
+logger = logging.getLogger("data_cleaning")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("[cleaning] %(levelname)s: %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 
 def ensure_processed_dirs(processed_root: Path) -> Dict[str, Path]:
@@ -49,6 +60,33 @@ def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
         if key in cols:
             return cols[key]
     return None
+
+
+def _safe_write_csv(df: pd.DataFrame, path: Path) -> Path:
+    """Escribe CSV sin sobrescribir silenciosamente: si existe, añade sufijo con timestamp."""
+    path = Path(path)
+    if path.exists():
+        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+        new_name = f"{path.stem}_{ts}{path.suffix}"
+        new_path = path.with_name(new_name)
+        df.to_csv(new_path, index=False)
+        logger.info(f"Existing file {path} preserved; wrote {new_path} instead")
+        return new_path
+    else:
+        df.to_csv(path, index=False)
+        return path
+
+
+def validate_schema(df: pd.DataFrame, required: List[str], file_label: str) -> Tuple[bool, List[str]]:
+    """Valida que el DataFrame tenga las columnas requeridas.
+
+    Retorna (ok, missing_cols)
+    """
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        logger.error(f"{file_label}: missing required columns: {missing}")
+        return False, missing
+    return True, []
 
 
 def _parse_time_like(v: Any) -> float:
@@ -104,6 +142,14 @@ def clean_stations(raw_path: Path, processed_root: Path, thresholds: Optional[Di
     df = pd.read_csv(raw_path, dtype=str)
     report: Dict[str, Any] = {"file": raw_path.name, "original_rows": len(df)}
 
+    # parámetros por defecto
+    thresholds = thresholds or {}
+    min_lat = thresholds.get("min_lat", -90)
+    max_lat = thresholds.get("max_lat", 90)
+    min_lon = thresholds.get("min_lon", -180)
+    max_lon = thresholds.get("max_lon", 180)
+    id_pattern = thresholds.get("id_pattern", r"^[A-Za-z0-9_.-]+$")
+
     # Mapear columnas comunes a nombres esperados
     stop_col = _find_col(df, ["GTFS Stop ID", "stop_id", "stopid"])
     lat_col = _find_col(df, ["GTFS Latitude", "latitude", "lat"])
@@ -112,30 +158,67 @@ def clean_stations(raw_path: Path, processed_root: Path, thresholds: Optional[Di
     if stop_col is None or lat_col is None or lon_col is None:
         raise ValueError(f"stations CSV missing required columns. Found columns: {list(df.columns)}")
 
-    # Normalizar identificadores y coordenadas
+    # Normalize and basic corrections
     df[stop_col] = df[stop_col].astype(str).str.strip()
+    corrected = 0
+    # numeric coercion
     df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
     df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
+    corrected += int(df[lat_col].notna().sum() + df[lon_col].notna().sum())
 
-    # Contar coordenadas inválidas y eliminarlas: lat fuera de [-90,90], lon fuera de [-180,180]
-    # IMPORTANTE: coordenadas inválidas rompen la geometría de rutas (LineString)
-    # y dan distancias métricas erróneas al proyectar a EPSG:3857. Por eso
-    # las filas sin coordenadas útiles se descartan o requieren imputación
-    # explícita si se dispone de otra fuente.
     before = len(df)
-    invalid_coord_mask = df[lat_col].isna() | df[lon_col].isna() | (df[lat_col] < -90) | (df[lat_col] > 90) | (df[lon_col] < -180) | (df[lon_col] > 180)
+
+    # Detectar coordenadas inválidas
+    invalid_coord_mask = (
+        df[lat_col].isna() | df[lon_col].isna() | (df[lat_col] < min_lat) | (df[lat_col] > max_lat) | (df[lon_col] < min_lon) | (df[lon_col] > max_lon)
+    )
     invalid_coords = int(invalid_coord_mask.sum())
     df_valid = df[~invalid_coord_mask].copy()
 
-    # Duplicados exactos (stop_id, lat, lon)
+    # Detección de IDs malformados
+    bad_id_mask = ~df_valid[stop_col].astype(str).str.match(id_pattern)
+    bad_ids = int(bad_id_mask.sum())
+    # intentar limpiar IDs malformados (trim y extraer prefijo numérico)
+    if bad_ids > 0:
+        logger.info(f"{bad_ids} station IDs appear malformed; attempting basic cleanup")
+        def _fix_id(s: str) -> str:
+            s2 = str(s).strip()
+            m = re.match(r"^(\d+)[A-Za-z].*$", s2)
+            if m:
+                return m.group(1)
+            return s2
+
+        df_valid[stop_col] = df_valid[stop_col].apply(_fix_id)
+        # Re-evaluate
+        bad_id_mask = ~df_valid[stop_col].astype(str).str.match(id_pattern)
+        bad_ids_after = int(bad_id_mask.sum())
+        corrected += (bad_ids - bad_ids_after)
+        bad_ids = bad_ids_after
+
+    # Duplicados por (stop_id, lat, lon)
     dup_subset = [stop_col, lat_col, lon_col]
-    dup_before = len(df_valid)
     duplicates_mask = df_valid.duplicated(subset=dup_subset, keep="first")
     dup_count = int(duplicates_mask.sum())
     df_valid = df_valid.loc[~duplicates_mask].copy()
 
+    # Duplicados de stop_id con coordenadas distintas -> resolver conservando fila con más datos
+    dup_id_counts = df_valid.duplicated(subset=[stop_col], keep=False).sum()
+    if dup_id_counts > 0:
+        # agrupar y conservar el primer con menos nulos
+        def _keep_best(group):
+            nonnull_counts = group.notna().sum(axis=1)
+            return group.loc[nonnull_counts.idxmax()]
+        groups = df_valid.groupby(stop_col)
+        to_keep = []
+        for name, g in groups:
+            if len(g) == 1:
+                to_keep.append(g.index[0])
+            else:
+                best = _keep_best(g)
+                to_keep.append(best.name)
+        df_valid = df_valid.loc[to_keep].copy()
+
     # Descartar por completo 'CBD' y 'Borough' según petición del usuario.
-    # No deben influir en ninguna etapa del preprocesado ni en las salidas.
     dropped_cols: List[str] = []
     drop_counts: Dict[str, int] = {}
     for c in ["CBD", "Borough"]:
@@ -143,13 +226,11 @@ def clean_stations(raw_path: Path, processed_root: Path, thresholds: Optional[Di
             drop_counts[c] = int(df_valid[c].notna().sum())
             df_valid = df_valid.drop(columns=[c])
             dropped_cols.append(c)
-    # No se realizan imputaciones para estas columnas
-    imputed = 0
 
     # Construir GeoDataFrame en WGS84
     gdf = gpd.GeoDataFrame(df_valid, geometry=gpd.points_from_xy(df_valid[lon_col].astype(float), df_valid[lat_col].astype(float)), crs="EPSG:4326")
 
-    # Proyectar para coordenadas métricas (EPSG:3857)
+    # Proyectar para coordenadas métricas (EPSG:3857) y calcular x/y
     gdf_proj = gdf.to_crs(epsg=3857)
     gdf["_x"] = gdf_proj.geometry.x
     gdf["_y"] = gdf_proj.geometry.y
@@ -158,22 +239,28 @@ def clean_stations(raw_path: Path, processed_root: Path, thresholds: Optional[Di
     # Guardar geometría como WKT y mantener columnas originales
     gdf_out = gdf.copy()
     gdf_out["geometry_wkt"] = gdf_out.geometry.apply(lambda g: g.wkt if g is not None else "")
-    gdf_out.to_csv(out_path, index=False)
+    out_written = _safe_write_csv(gdf_out, out_path)
 
+    kept = len(gdf)
+    dropped = before - kept
     report.update({
-        "kept_rows": len(gdf),
-        "dropped_rows": before - len(gdf),
+        "kept_rows": kept,
+        "dropped_rows": dropped,
         "invalid_coords": invalid_coords,
         "duplicates_removed": dup_count,
-        "imputed_values": imputed,
+        "malformed_ids_remaining": bad_ids,
+        "corrected_rows": corrected,
         "dropped_columns": dropped_cols,
         "dropped_counts": drop_counts,
+        "columns": list(gdf_out.columns),
+        "coverage_pct": float(kept) / float(before) if before > 0 else None,
         "crs": "EPSG:4326",
+        "out_path": str(out_written),
     })
-    return out_path, report
+    return out_written, report
 
 
-def clean_stop_times(raw_path: Path, processed_root: Path, station_ids: Optional[set] = None, thresholds: Optional[Dict[str, Any]] = None) -> Tuple[Path, Dict[str, Any]]:
+def clean_stop_times(raw_path: Path, processed_root: Path, station_ids: Optional[set] = None, thresholds: Optional[Dict[str, Any]] = None, trips_map: Optional[Dict[str, str]] = None) -> Tuple[Path, Dict[str, Any]]:
     """Valida y limpia el CSV de stop_times.
 
     - Normaliza columnas de trip_id/stop_id/arrival/departure.
@@ -284,18 +371,28 @@ def clean_trips(raw_path: Optional[Path], processed_root: Path) -> Tuple[Optiona
     tcols = {c.lower(): c for c in df.columns}
     t_trip_col = tcols.get("trip_uid") or tcols.get("trip_id")
     route_col = tcols.get("route_id")
-    mapping = {}
+    mapping: Dict[str, str] = {}
+    inconsistent = 0
     if t_trip_col and route_col:
-        mapping = dict(zip(df[t_trip_col].astype(str), df[route_col].astype(str)))
+        # detectar trip_id duplicados que apuntan a diferentes route_id
+        grp = df.groupby(t_trip_col)[route_col].nunique()
+        inconsistent = int((grp > 1).sum())
+        if inconsistent > 0:
+            logger.warning(f"{inconsistent} trip_ids map to multiple route_id values; keeping first occurrence")
+        # conservar la primera aparición por trip_id
+        df_clean = df.drop_duplicates(subset=[t_trip_col], keep="first").copy()
+        mapping = dict(zip(df_clean[t_trip_col].astype(str), df_clean[route_col].astype(str)))
         report["has_route_mapping"] = True
-        report["kept_rows"] = len(df)
+        report["kept_rows"] = len(df_clean)
     else:
+        df_clean = df.copy()
         report["has_route_mapping"] = False
-        report["kept_rows"] = len(df)
+        report["kept_rows"] = len(df_clean)
 
     out_path = dirs["cleaned"] / "cleaned_trip_times.csv"
-    df.to_csv(out_path, index=False)
-    return out_path, report, mapping
+    out_written = _safe_write_csv(df_clean, out_path)
+    report.update({"inconsistent_trip_mappings": inconsistent, "out_path": str(out_written)})
+    return out_written, report, mapping
 
 
 def write_manifest(manifest: Dict[str, Any], manifests_dir: Path) -> Path:
@@ -314,134 +411,3 @@ def write_quality_report(report: Dict[str, Any], metrics_dir: Path) -> Path:
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, ensure_ascii=False)
     return path
-
-
-def compute_and_save_metrics(G, gdf_nodes: gpd.GeoDataFrame, gdf_lines: gpd.GeoDataFrame, reports: List[Dict[str, Any]], processed_root: Path, scenario_id: str = "default", select_routes: Optional[List[str]] = None, target_km: Optional[float] = None, curve_penalty: Optional[float] = None, tolerance: Optional[float] = None) -> Dict[str, Any]:
-    """Computa métricas simples de preprocesado y guarda CSVs resumidos.
-
-    Métricas implementadas: representatividad antes/después, missingness,
-    duplicate rate, valid stop_id matching rate, edge coverage rate y
-    resumen por ruta (agregado por día y por ruta si hay datos).
-    """
-    dirs = ensure_processed_dirs(processed_root)
-    metrics = {}
-
-    # Agregar estadísticos de grafo
-    num_nodes = G.number_of_nodes()
-    total_edges = G.number_of_edges()
-    spatial_edges = sum(1 for _, _, _, d in G.edges(keys=True, data=True) if d.get("spatial"))
-    observed_edges = sum(1 for _, _, _, d in G.edges(keys=True, data=True) if d.get("observed"))
-    edge_coverage = float(observed_edges) / float(spatial_edges) if spatial_edges > 0 else None
-
-    metrics.update({
-        "num_nodes": num_nodes,
-        "total_edges": total_edges,
-        "spatial_edges": spatial_edges,
-        "observed_edges": observed_edges,
-        "edge_coverage_rate": edge_coverage,
-    })
-
-    # Representativeness y rates a partir de reports concatenados
-    for r in reports:
-        key = r.get("file") or "unknown"
-        metrics[f"{key}_original_rows"] = r.get("original_rows")
-        metrics[f"{key}_kept_rows"] = r.get("kept_rows")
-        if r.get("original_rows"):
-            metrics[f"{key}_representativeness"] = float(r.get("kept_rows", 0)) / float(r.get("original_rows"))
-
-    # Guardar resumen de grafo
-    graph_stats_path = dirs["metrics"] / "graph_stats.csv"
-    pd.DataFrame([metrics]).to_csv(graph_stats_path, index=False)
-
-    # Resumen de rutas: agregar por route_id si existen aristas con 'route_id'
-    route_rows = []
-    for u, v, k, d in G.edges(keys=True, data=True):
-        route = d.get("route_id") or d.get("line")
-        length_km = float(d.get("length_m", 0.0)) / 1000.0 if d.get("length_m") is not None else 0.0
-        travel = float(d.get("travel_time_s", 0.0)) if d.get("travel_time_s") is not None else np.nan
-        route_rows.append({"route": route, "length_km": length_km, "travel_time_s": travel})
-
-    if route_rows:
-        df_routes = pd.DataFrame(route_rows)
-        summary = df_routes.groupby("route").agg({"length_km": "sum", "travel_time_s": ["mean", "count"]})
-        # Aplanar multiindex
-        summary.columns = ["_" . join(col).strip() for col in summary.columns.values]
-        summary = summary.reset_index()
-        fname = f"route_summary_{scenario_id}_t{target_km}_c{curve_penalty}_tol{tolerance}.csv"
-        out_path = dirs["metrics"] / fname
-        summary.to_csv(out_path, index=False)
-        metrics["route_summary_path"] = str(out_path)
-
-    # Si existe stop_times limpio, generar resúmenes por día y por weekday/weekend
-    try:
-        cleaned_st_path = dirs["cleaned"] / "cleaned_stop_times.csv"
-        if cleaned_st_path.exists():
-            st = pd.read_csv(cleaned_st_path, dtype=str)
-            st_cols = {c.lower(): c for c in st.columns}
-            trip_col = st_cols.get("trip_uid") or st_cols.get("trip_id")
-            stop_col = st_cols.get("stop_id")
-
-            # detectar o derivar fecha de servicio
-            date_col = None
-            for c in st.columns:
-                if c.lower() in ("service_date", "date", "servicedate"):
-                    date_col = c
-                    break
-
-            if date_col:
-                st["_service_date"] = pd.to_datetime(st[date_col], errors="coerce").dt.date
-            else:
-                # si no hay columna explícita, intentar derivar desde una columna *_secs (epoch seconds)
-                secs_col = None
-                for cc in st.columns:
-                    if "_secs" in cc.lower() or cc.lower().endswith("secs"):
-                        secs_col = cc
-                        break
-                if secs_col:
-                    try:
-                        st["_service_date"] = pd.to_datetime(pd.to_numeric(st[secs_col], errors="coerce"), unit="s", errors="coerce").dt.date
-                    except Exception:
-                        st["_service_date"] = pd.NaT
-
-            # si tenemos fechas (derivadas o explícitas), calcular resúmenes diarios y weekday/weekend
-            if "_service_date" in st.columns and st["_service_date"].notna().any():
-                daily = st.groupby("_service_date").agg(total_records=(trip_col, "count"), unique_trips=(trip_col, "nunique"))
-                daily = daily.reset_index()
-                daily_path = dirs["metrics"] / f"stop_times_daily_summary_{scenario_id}.csv"
-                daily.to_csv(daily_path, index=False)
-                metrics["stop_times_daily_summary"] = str(daily_path)
-
-                # weekday/weekend summary
-                try:
-                    st["_weekday"] = pd.to_datetime(st["_service_date"], errors="coerce").dt.weekday
-                    st["_is_weekend"] = st["_weekday"] >= 5
-                    wk = st.groupby("_is_weekend").agg(total_records=(trip_col, "count"), unique_trips=(trip_col, "nunique"))
-                    wk = wk.reset_index()
-                    wk_path = dirs["metrics"] / f"stop_times_weekday_summary_{scenario_id}.csv"
-                    wk.to_csv(wk_path, index=False)
-                    metrics["stop_times_weekday_summary"] = str(wk_path)
-                except Exception:
-                    pass
-
-                # per-route daily summary if trips mapping exists
-                cleaned_trips_path = dirs["cleaned"] / "cleaned_trip_times.csv"
-                if cleaned_trips_path.exists():
-                    try:
-                        trips_df = pd.read_csv(cleaned_trips_path, dtype=str)
-                        tcols = {c.lower(): c for c in trips_df.columns}
-                        t_trip_col = tcols.get("trip_uid") or tcols.get("trip_id")
-                        route_col = tcols.get("route_id")
-                        if t_trip_col and route_col:
-                            trips_map = dict(zip(trips_df[t_trip_col].astype(str), trips_df[route_col].astype(str)))
-                            st["_route_id"] = st[trip_col].map(trips_map)
-                            per_route = st.groupby(["_service_date", "_route_id"]).agg(total_records=(trip_col, "count"), unique_trips=(trip_col, "nunique"))
-                            per_route = per_route.reset_index()
-                            per_route_path = dirs["metrics"] / f"per_route_daily_summary_{scenario_id}.csv"
-                            per_route.to_csv(per_route_path, index=False)
-                            metrics["per_route_daily_summary"] = str(per_route_path)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-
-    return metrics

@@ -17,6 +17,16 @@ from pathlib import Path
 import os
 import re
 from collections import defaultdict
+import logging
+
+# configurar logger simple para información durante el preprocesado
+logger = logging.getLogger("data_cleaning")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("[cleaning] %(levelname)s: %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 import pandas as pd
 import geopandas as gpd
@@ -31,25 +41,9 @@ from .cleaning import (
     clean_stop_times,
     clean_trips,
     write_manifest,
-    write_quality_report,
-    compute_and_save_metrics,
+    write_quality_report
 )
 from sklearn.decomposition import PCA
-
-
-def _parse_bool_like(v):
-    if pd.isna(v):
-        return False
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        try:
-            return int(v) == 1
-        except Exception:
-            return bool(v)
-    s = str(v).strip().lower()
-    return s in {"1", "true", "t", "yes", "y", "si", "s"}
-
 
 def _load_nodes_from_csv(path: str) -> gpd.GeoDataFrame:
     print(f"[load_nyc_mta] Reading stations CSV from {path}")
@@ -364,13 +358,123 @@ def load_processed_gdfs(processed_dir: str) -> Tuple[gpd.GeoDataFrame, gpd.GeoDa
     return gdf_nodes, gdf_lines
 
 
+def compute_and_save_metrics(G, gdf_nodes: gpd.GeoDataFrame, gdf_lines: gpd.GeoDataFrame, reports: List[Dict[str, Any]], processed_root: Path, scenario_id: str = "default", select_routes: Optional[List[str]] = None, target_km: Optional[float] = None, curve_penalty: Optional[float] = None, tolerance: Optional[float] = None) -> Dict[str, Any]:
+    """Computa métricas simples de preprocesado y guarda CSVs resumidos."""
+    metrics = {
+        "num_nodes": int(G.number_of_nodes()) if G is not None else 0,
+        "num_edges": int(G.number_of_edges()) if G is not None else 0,
+        "processing_date": pd.Timestamp.now().isoformat(),
+    }
 
-def load_nyc_mta(
+    # Generar métricas de rutas por escenario (sin particionado por día)
+    outputs_root = Path("src") / "outputs"
+    out_dir = outputs_root / scenario_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    route_metrics_rows = []
+
+    # Si tenemos líneas procesadas, generar candidatos y calcular métricas por segmento
+    if gdf_lines is not None and not gdf_lines.empty:
+        gdf_proj = gdf_lines.to_crs(epsg=3857)
+        for idx, row in gdf_lines.iterrows():
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+            geom_proj = gdf_proj.loc[idx].geometry
+            coords_lonlat = list(geom.coords)
+            coords_proj = list(geom_proj.coords)
+            if len(coords_proj) < 2:
+                continue
+            # cumulative distances using projected coords
+            cum = [0.0]
+            for i in range(1, len(coords_proj)):
+                a = coords_proj[i-1]
+                b = coords_proj[i]
+                dist = float(np.hypot(b[0]-a[0], b[1]-a[1]))
+                cum.append(cum[-1] + dist)
+            n = len(coords_proj)
+            # generar subtramos i<j
+            for i in range(n-1):
+                for j in range(i+1, n):
+                    path_len = cum[j] - cum[i]
+                    if path_len <= 0:
+                        continue
+                    chord = float(np.hypot(coords_proj[j][0]-coords_proj[i][0], coords_proj[j][1]-coords_proj[i][1]))
+                    # convertir a km
+                    length_real_km = path_len / 1000.0
+                    length_straight_km = chord / 1000.0 if chord > 0 else 0.0
+                    straightness_index = length_real_km / length_straight_km if length_straight_km > 0 else None
+                    # si target_km proporcionado, filtrar por tolerancia
+                    accept_by_length = True
+                    abs_error_km = None
+                    relative_error = None
+                    accept_within_tol = None
+                    if target_km is not None and tolerance is not None:
+                        abs_error_km = abs(length_real_km - float(target_km))
+                        relative_error = abs_error_km / float(target_km) if float(target_km) != 0 else None
+                        accept_within_tol = (relative_error is not None and relative_error <= float(tolerance))
+                        accept_by_length = accept_within_tol
+
+                    straightness_c = (chord / path_len) if path_len > 0 else 0.0
+                    score = straightness_c - (float(curve_penalty) * (abs(length_real_km - float(target_km)) / (float(target_km) + 1e-9))) if target_km is not None and curve_penalty is not None else straightness_c
+
+                    seg_geom = LineString(coords_lonlat[i:j+1])
+                    route_metrics_rows.append({
+                        "line": row.get("Line", ""),
+                        "line_idx": idx,
+                        "start_idx": i,
+                        "end_idx": j,
+                        "length_real_km": length_real_km,
+                        "length_straight_km": length_straight_km,
+                        "straightness_index": straightness_index,
+                        "abs_error_km": abs_error_km,
+                        "relative_error": relative_error,
+                        "acceptance_within_tolerance": bool(accept_within_tol) if accept_within_tol is not None else None,
+                        "score": float(score) if score is not None else None,
+                        "geometry_wkt": seg_geom.wkt,
+                    })
+
+    df_route_metrics = pd.DataFrame(route_metrics_rows)
+    # Si se especificó target_km y tolerance, filtrar filas aceptadas
+    if not df_route_metrics.empty and target_km is not None and tolerance is not None:
+        df_route_metrics["accepted"] = df_route_metrics["acceptance_within_tolerance"].fillna(False)
+    else:
+        df_route_metrics["accepted"] = False
+
+    # ordenar y rankear por cercanía al objetivo si existe
+    if not df_route_metrics.empty and "abs_error_km" in df_route_metrics.columns:
+        df_route_metrics["rank_abs_error"] = df_route_metrics["abs_error_km"].rank(method="min")
+
+    # Guardar route_metrics_summary en outputs/<scenario_tag>
+    route_metrics_path = out_dir / f"route.csv"
+    df_route_metrics.to_csv(route_metrics_path, index=False)
+
+    # Actualizar índice general de escenarios
+    scenario_record = {
+        "scenario_id": scenario_id,
+        "target_km": target_km,
+        "curve_penalty": curve_penalty,
+        "tolerance": tolerance,
+        "num_candidates": len(df_route_metrics),
+        "num_accepted": int(df_route_metrics["accepted"].sum()) if not df_route_metrics.empty else 0,
+        "route_metrics_path": str(route_metrics_path),
+    }
+
+    metrics.update({
+        "route_metrics_path": str(route_metrics_path),
+        "route_count_by_scenario": int(scenario_record["num_candidates"]),
+        "accepted_count": int(scenario_record["num_accepted"]),
+    })
+
+    return metrics
+
+
+
+def general_pipeline(
     path: str,
     stop_times_path: Optional[str] = None,
     trips_path: Optional[str] = None,
     scenario_id: str = "default",
-    select_routes: Optional[List[str]] = None,
     target_km: Optional[float] = None,
     curve_penalty: Optional[float] = None,
     tolerance: Optional[float] = None,
@@ -391,23 +495,119 @@ def load_nyc_mta(
     dirs = ensure_processed_dirs(processed_root)
 
     # 0) etapa de limpieza de estaciones (produce cleaned_stations.csv)
-    try:
-        cleaned_stations_path, stations_report = clean_stations(Path(path), processed_root, thresholds=cleaning_thresholds)
+    cleaned_dir = dirs["cleaned"]
+    graph_dir = dirs["graph"]
+
+    cleaned_stations_path = cleaned_dir / "cleaned_stations.csv"
+    cleaned_stop_times_path = cleaned_dir / "cleaned_stop_times.csv"
+    cleaned_trips_path = cleaned_dir / "cleaned_trip_times.csv"
+
+    reports = []
+
+    # Si ya existen los CSV limpios, evitar re-ejecución de limpieza
+    if cleaned_stations_path.exists():
         stations_csv_path = str(cleaned_stations_path)
-        print(f"[load_nyc_mta] Cleaned stations written to {cleaned_stations_path}")
-    except Exception as e:
-        print(f"[load_nyc_mta] Warning: failed cleaning stations: {e}; falling back to raw file")
-        stations_report = {"file": Path(path).name, "original_rows": None}
-        stations_csv_path = path
+        stations_report = {"file": cleaned_stations_path.name, "note": "skipped_cleaning_exists", "out_path": str(cleaned_stations_path)}
+        print(f"[load_nyc_mta] Found existing cleaned stations at {cleaned_stations_path}; skipping cleaning")
+        reports.append(stations_report)
+    else:
+        try:
+            cleaned_stations_path, stations_report = clean_stations(Path(path), processed_root, thresholds=cleaning_thresholds)
+            stations_csv_path = str(cleaned_stations_path)
+            print(f"[load_nyc_mta] Cleaned stations written to {cleaned_stations_path}")
+            reports.append(stations_report)
+        except Exception as e:
+            print(f"[load_nyc_mta] Warning: failed cleaning stations: {e}; falling back to raw file")
+            stations_report = {"file": Path(path).name, "original_rows": None}
+            stations_csv_path = path
+            reports.append(stations_report)
 
     # 1) read stations and build nodes GeoDataFrame (desde el CSV limpio)
-    gdf_nodes = _load_nodes_from_csv(stations_csv_path)
+    # Si ya existe grafo procesado completo en graph/, cargarlo en lugar de reconstruir
+    graph_nodes_csv = graph_dir / "nodes.csv"
+    graph_edges_csv = graph_dir / "edges.csv"
+    graph_lines_csv = graph_dir / "lines.csv"
 
-    # 2) build line geometries and ordering
-    gdf_lines, line_orders = _build_lines_from_nodes(gdf_nodes)
+    if graph_nodes_csv.exists() and graph_edges_csv.exists() and graph_lines_csv.exists():
+        print(f"[load_nyc_mta] Found existing processed graph in {graph_dir}; loading instead of rebuilding")
+        # load_processed_gdfs devuelve gdf_nodes, gdf_lines
+        gdf_nodes, gdf_lines = load_processed_gdfs(str(graph_dir))
+        # Reconstruir G a partir de nodes/edges CSVs
+        print("[load_nyc_mta] Reconstructing NetworkX graph from CSVs")
+        G = nx.MultiDiGraph()
+        node_meta = {}
+        for _, row in gdf_nodes.iterrows():
+            node_id = str(row["GTFS Stop ID"])
+            attrs = {k: row[k] for k in row.index if k not in {"GTFS Stop ID", "geometry", "geometry_wkt"}}
+            # Normalizar nombres de coordenadas para mantener compatibilidad
+            # con la estructura esperada por el resto del código (x,y,lon,lat)
+            if "_x" in row.index and pd.notna(row.get("_x")):
+                try:
+                    attrs["x"] = float(row.get("_x"))
+                except Exception:
+                    pass
+            elif "x" in row.index and pd.notna(row.get("x")):
+                try:
+                    attrs["x"] = float(row.get("x"))
+                except Exception:
+                    pass
+            if "_y" in row.index and pd.notna(row.get("_y")):
+                try:
+                    attrs["y"] = float(row.get("_y"))
+                except Exception:
+                    pass
+            elif "y" in row.index and pd.notna(row.get("y")):
+                try:
+                    attrs["y"] = float(row.get("y"))
+                except Exception:
+                    pass
+            if "GTFS Longitude" in row.index and pd.notna(row.get("GTFS Longitude")):
+                try:
+                    attrs["lon"] = float(row.get("GTFS Longitude"))
+                except Exception:
+                    pass
+            if "GTFS Latitude" in row.index and pd.notna(row.get("GTFS Latitude")):
+                try:
+                    attrs["lat"] = float(row.get("GTFS Latitude"))
+                except Exception:
+                    pass
+            # preservar geometría si está presente
+            if "geometry" in row.index and row["geometry"] is not None:
+                attrs["geometry"] = row["geometry"]
+            G.add_node(node_id, **attrs)
+            node_meta[node_id] = attrs
 
-    # 3) build structural graph (nodes + spatial edges)
-    G, node_meta = _build_graph_from_nodes_and_lines(gdf_nodes, line_orders)
+        # Cargar edges.csv manualmente
+        try:
+            edf = pd.read_csv(str(graph_edges_csv))
+            for _, r in edf.iterrows():
+                u = r["u"]
+                v = r["v"]
+                key = r.get("key", None)
+                edata = {k: v for k, v in r.items() if k not in {"u", "v", "key", "geometry_wkt"}}
+                if "geometry_wkt" in r and pd.notna(r["geometry_wkt"]) and r["geometry_wkt"] != "":
+                    try:
+                        edata["geometry"] = wkt.loads(r["geometry_wkt"])
+                    except Exception:
+                        pass
+                if key is not None and not pd.isna(key):
+                    try:
+                        G.add_edge(u, v, key=key, **edata)
+                    except Exception:
+                        G.add_edge(u, v, **edata)
+                else:
+                    G.add_edge(u, v, **edata)
+        except Exception as e:
+            print(f"[load_nyc_mta] Warning: failed reading edges.csv: {e}; graph may be incomplete")
+
+    else:
+        gdf_nodes = _load_nodes_from_csv(stations_csv_path)
+
+        # 2) build line geometries and ordering
+        gdf_lines, line_orders = _build_lines_from_nodes(gdf_nodes)
+
+        # 3) build structural graph (nodes + spatial edges)
+        G, node_meta = _build_graph_from_nodes_and_lines(gdf_nodes, line_orders)
 
     # --- Si hay stop_times disponibles, limpiar y calcular tiempo promedio por arista ---
     # stop_times: debe contener columnas como 'trip_uid','stop_id','arrival_time','departure_time'
@@ -421,32 +621,54 @@ def load_nyc_mta(
         candidates = [f for f in os.listdir(base_dir) if "trip" in f and f.endswith(".csv")]
         trips_path = os.path.join(base_dir, candidates[0]) if candidates else None
 
-    # 4) limpiar stop_times y trips (si existen) antes de procesar
-    reports = [stations_report]
-
-    cleaned_stop_times_path = None
-    cleaned_trips_path = None
+    # 4) limpiar trips y stop_times (si existen) antes de procesar
+    # Usar archivos limpios existentes si están presentes para evitar re-ejecuciones
     trips_map = {}
-    if stop_times_path and os.path.exists(stop_times_path):
-        try:
-            station_ids = set(gdf_nodes["GTFS Stop ID"].astype(str).values)
-            cleaned_stop_times_path, stop_report = clean_stop_times(Path(stop_times_path), processed_root, station_ids, thresholds=cleaning_thresholds)
-            reports.append(stop_report)
-            print(f"[load_nyc_mta] Cleaned stop_times written to {cleaned_stop_times_path}")
-            stop_times_to_process = str(cleaned_stop_times_path)
-        except Exception as e:
-            print(f"[load_nyc_mta] Warning: failed cleaning stop_times: {e}; using raw file")
-            stop_times_to_process = stop_times_path
-    else:
-        stop_times_to_process = stop_times_path
 
-    if trips_path and os.path.exists(trips_path):
+    # Primero trips
+    # Determine trips cleaned file: prefer existing cleaned file in processed, else clean raw if available
+    if cleaned_trips_path.exists():
+        cleaned_trips_path = cleaned_trips_path
         try:
-            cleaned_trips_path, trips_report, trips_map = clean_trips(Path(trips_path), processed_root)
+            trips_df = pd.read_csv(str(cleaned_trips_path), dtype=str)
+            tcols = {c.lower(): c for c in trips_df.columns}
+            t_trip_col = tcols.get("trip_uid") or tcols.get("trip_id")
+            route_col = tcols.get("route_id")
+            if t_trip_col and route_col:
+                trips_map = dict(zip(trips_df[t_trip_col].astype(str), trips_df[route_col].astype(str)))
+            trips_report = {"file": cleaned_trips_path.name, "note": "skipped_cleaning_exists", "out_path": str(cleaned_trips_path)}
             reports.append(trips_report)
-            print(f"[load_nyc_mta] Cleaned trips written to {cleaned_trips_path}")
-        except Exception as e:
-            print(f"[load_nyc_mta] Warning: failed cleaning trips: {e}; using raw file")
+            print(f"[load_nyc_mta] Found existing cleaned trips at {cleaned_trips_path}; skipping cleaning")
+        except Exception:
+            trips_map = {}
+    else:
+        if trips_path and os.path.exists(trips_path):
+            try:
+                cleaned_trips_path, trips_report, trips_map = clean_trips(Path(trips_path), processed_root)
+                reports.append(trips_report)
+                print(f"[load_nyc_mta] Cleaned trips written to {cleaned_trips_path}")
+            except Exception as e:
+                print(f"[load_nyc_mta] Warning: failed cleaning trips: {e}; using raw file")
+
+    # Luego stop_times: preferir archivo limpio existente si está presente
+    if cleaned_stop_times_path.exists():
+        stop_times_to_process = str(cleaned_stop_times_path)
+        stop_report = {"file": cleaned_stop_times_path.name, "note": "skipped_cleaning_exists", "out_path": str(cleaned_stop_times_path)}
+        reports.append(stop_report)
+        print(f"[load_nyc_mta] Found existing cleaned stop_times at {cleaned_stop_times_path}; skipping cleaning")
+    else:
+        if stop_times_path and os.path.exists(stop_times_path):
+            try:
+                station_ids = set(gdf_nodes["GTFS Stop ID"].astype(str).values)
+                cleaned_stop_times_path, stop_report = clean_stop_times(Path(stop_times_path), processed_root, station_ids, thresholds=cleaning_thresholds, trips_map=trips_map if trips_map else None)
+                reports.append(stop_report)
+                print(f"[load_nyc_mta] Cleaned stop_times written to {cleaned_stop_times_path}")
+                stop_times_to_process = str(cleaned_stop_times_path)
+            except Exception as e:
+                print(f"[load_nyc_mta] Warning: failed cleaning stop_times: {e}; using raw file")
+                stop_times_to_process = stop_times_path
+        else:
+            stop_times_to_process = stop_times_path
 
     # 5) procesar stop_times (si existe) usando el CSV limpio cuando esté disponible
     _process_stop_times(stop_times_to_process, G, node_meta, gdf_nodes, trips_path=cleaned_trips_path or trips_path)
@@ -463,12 +685,7 @@ def load_nyc_mta(
         print(f"[load_nyc_mta] Saved processed CSVs to {graph_dir}")
     except Exception as e:
         print(f"[load_nyc_mta] Warning: failed saving processed files: {e}")
-    # Para compatibilidad con scripts existentes que esperan nodes.csv en processed/
-    try:
-        save_processed_graph(G, gdf_nodes, gdf_lines, str(dirs["root"]))
-        print(f"[load_nyc_mta] Also saved processed CSVs to {dirs['root']}")
-    except Exception:
-        pass
+    # Graph CSVs are saved only in the `graph/` subdirectory to avoid duplication
 
     # Guardar manifest y reporte de calidad (aggregado)
     try:
@@ -494,100 +711,10 @@ def load_nyc_mta(
             reports,
             processed_root,
             scenario_id=scenario_id,
-            select_routes=select_routes,
-            target_km=target_km,
+            target_km=target_km,    
             curve_penalty=curve_penalty,
             tolerance=tolerance,
         )
         print(f"[load_nyc_mta] Computed preprocessing metrics: {metrics}")
     except Exception as e:
         print(f"[load_nyc_mta] Warning: failed computing metrics: {e}")
-
-
-def visualize_nodes_edges(
-    gdf_nodes: gpd.GeoDataFrame,
-    gdf_lines: gpd.GeoDataFrame,
-    show_labels: bool = False,
-    figsize: Tuple[int, int] = (10, 10),
-    node_size: int = 30,
-    node_color: str = "tab:red",
-    edge_color: str = "gray",
-    edge_width: float = 1.0,
-    edge_alpha: float = 0.7,
-    colormap_name: str = "tab20",
-) -> plt.Axes:
-    """Visualiza nodos y aristas del grafo.
-
-    Cada geometría en `gdf_lines` se colorea según su valor en la columna `Line`.
-
-    Args:
-        line_colormap: Optional mapping {line_name: color} para usar colores personalizados.
-        colormap_name: Nombre de colormap matplotlib a usar si no se aporta `line_colormap`.
-        show_legend: Si True, muestra una leyenda con las líneas.
-    """
-
-    # Preparar ejes
-    _, ax = plt.subplots(figsize=figsize)
-
-    # Dibujar líneas (servicios) coloreadas por 'Line' si existe la columna
-    if gdf_lines is not None and not gdf_lines.empty and "Line" in gdf_lines.columns:
-        unique_lines = list(gdf_lines["Line"].astype(str).fillna("").unique())
-
-        # # Generar mapping de colores si no se proporciona uno
-        # if line_colormap is None:
-        cmap = plt.get_cmap(colormap_name)
-        n = len(unique_lines)
-        if n <= 1:
-            colors = [cmap(0)]
-        else:
-            colors = [cmap(i / max(1, n - 1)) for i in range(n)]
-        import matplotlib.colors as mcolors
-        color_hex = [mcolors.to_hex(c) for c in colors]
-        line_colormap = dict(zip(unique_lines, color_hex))
-
-        for ln in unique_lines:
-            subset = gdf_lines[gdf_lines["Line"].astype(str) == ln]
-            color = line_colormap.get(ln, edge_color)
-            if not subset.empty:
-                subset.plot(ax=ax, linewidth=edge_width, alpha=edge_alpha, color=color, zorder=1)
-
-        # Leyenda
-        # if show_legend:
-        #     import matplotlib.patches as mpatches
-        #     handles = [mpatches.Patch(color=line_colormap.get(ln, edge_color), label=str(ln)) for ln in unique_lines]
-        #     ax.legend(handles=handles, loc="upper right", fontsize=6, framealpha=0.9)
-    else:
-        # Fallback: dibujar todas las líneas con el mismo color
-        if gdf_lines is not None and not gdf_lines.empty:
-            gdf_lines.plot(ax=ax, linewidth=edge_width, alpha=edge_alpha, color=edge_color, zorder=1)
-
-    # Dibujar nodos encima
-    if gdf_nodes is not None and not gdf_nodes.empty:
-        gdf_nodes.plot(ax=ax, markersize=node_size, color=node_color, zorder=3)
-        # Etiquetas opcionales
-        if show_labels:
-            for _, row in gdf_nodes.iterrows():
-                if row.geometry is None:
-                    continue
-                x, y = row.geometry.x, row.geometry.y
-                label = row.get("GTFS Stop ID") or row.get("node_id") or ""
-                ax.text(x, y, str(label), fontsize=6, zorder=4)
-
-        # Ajustar límites del plot según el bbox del grafo (gdf_nodes)
-        xs = gdf_nodes.geometry.x.dropna()
-        ys = gdf_nodes.geometry.y.dropna()
-        if not xs.empty and not ys.empty:
-            minx, maxx = float(xs.min()), float(xs.max())
-            miny, maxy = float(ys.min()), float(ys.max())
-            dx = maxx - minx
-            dy = maxy - miny
-            margin_x = dx * 0.01 if dx != 0 else 0.005
-            margin_y = dy * 0.01 if dy != 0 else 0.005
-            ax.set_xlim(minx - margin_x, maxx + margin_x)
-            ax.set_ylim(miny - margin_y, maxy + margin_y)
-
-    ax.set_aspect("equal")
-    ax.set_axis_off()
-    plt.tight_layout()
-    plt.show()
-    return ax
