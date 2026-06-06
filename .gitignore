@@ -2,6 +2,5 @@ env/
 .vscode/
 __pycache__/
 */__pycache__/
-**/raw*/*.json
-**/raw*/*.csv
-**/processed/*.csv
+**/processed/*/*.json
+**/*.csv

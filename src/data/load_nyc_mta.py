@@ -12,7 +12,8 @@ La función devuelve un diccionario con el grafo (`networkx.Graph`), los
 GeoDataFrames de nodos y líneas y metadatos básicos.
 """
 
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Tuple, Optional, List
+from pathlib import Path
 import os
 import re
 from collections import defaultdict
@@ -24,6 +25,15 @@ import numpy as np
 import matplotlib.pyplot as plt
 from shapely.geometry import Point, LineString
 from shapely import wkt
+from .cleaning import (
+    ensure_processed_dirs,
+    clean_stations,
+    clean_stop_times,
+    clean_trips,
+    write_manifest,
+    write_quality_report,
+    compute_and_save_metrics,
+)
 from sklearn.decomposition import PCA
 
 
@@ -44,6 +54,11 @@ def _parse_bool_like(v):
 def _load_nodes_from_csv(path: str) -> gpd.GeoDataFrame:
     print(f"[load_nyc_mta] Reading stations CSV from {path}")
     df = pd.read_csv(path)
+    # Eliminar completamente las columnas 'CBD' y 'Borough' por petición del usuario.
+    for c in ["CBD", "Borough"]:
+        if c in df.columns:
+            print(f"[load_nyc_mta] Dropping column '{c}' as requested by user")
+            df = df.drop(columns=[c])
     stop_id_col = "GTFS Stop ID"
     lat_col = "GTFS Latitude"
     lon_col = "GTFS Longitude"
@@ -57,8 +72,7 @@ def _load_nodes_from_csv(path: str) -> gpd.GeoDataFrame:
     gdf_nodes["_x"] = gdf_proj.geometry.x
     gdf_nodes["_y"] = gdf_proj.geometry.y
 
-    print("[load_nyc_mta] Parsing CBD flag (assume header exists)")
-    gdf_nodes["is_cbd"] = gdf_nodes["CBD"].apply(_parse_bool_like)
+    # 'CBD' and 'Borough' are intentionally discarded; no parsing required.
 
     return gdf_nodes
 
@@ -99,8 +113,8 @@ def _build_graph_from_nodes_and_lines(gdf_nodes: gpd.GeoDataFrame, line_orders):
             "lat": float(row["GTFS Latitude"]) if pd.notna(row["GTFS Latitude"]) else None,
             "x": float(row["_x"]),
             "y": float(row["_y"]),
-            "borough": row.get("Borough"),
-            "is_cbd": bool(row.get("is_cbd", False)),
+            # 'Borough' and 'CBD' fueron descartados antes de la ingestión
+            # y por tanto no se incluyen como atributos de nodo.
             "lines": row.get("Line"),
             "structure": row.get("Structure", "unknown"),
             "geometry": row.geometry,
@@ -355,6 +369,12 @@ def load_nyc_mta(
     path: str,
     stop_times_path: Optional[str] = None,
     trips_path: Optional[str] = None,
+    scenario_id: str = "default",
+    select_routes: Optional[List[str]] = None,
+    target_km: Optional[float] = None,
+    curve_penalty: Optional[float] = None,
+    tolerance: Optional[float] = None,
+    cleaning_thresholds: Optional[Dict[str, Any]] = None,
 ):
     """Carga CSV de estaciones (GTFS-like) y construye GeoDataFrames y grafo.
 
@@ -365,8 +385,23 @@ def load_nyc_mta(
     """
  
     print(f"[load_nyc_mta] Starting load for {path}")
-    # 1) read stations and build nodes GeoDataFrame
-    gdf_nodes = _load_nodes_from_csv(path)
+
+    # Preparar directorios procesados
+    processed_root = Path("src") / "data" / "processed"
+    dirs = ensure_processed_dirs(processed_root)
+
+    # 0) etapa de limpieza de estaciones (produce cleaned_stations.csv)
+    try:
+        cleaned_stations_path, stations_report = clean_stations(Path(path), processed_root, thresholds=cleaning_thresholds)
+        stations_csv_path = str(cleaned_stations_path)
+        print(f"[load_nyc_mta] Cleaned stations written to {cleaned_stations_path}")
+    except Exception as e:
+        print(f"[load_nyc_mta] Warning: failed cleaning stations: {e}; falling back to raw file")
+        stations_report = {"file": Path(path).name, "original_rows": None}
+        stations_csv_path = path
+
+    # 1) read stations and build nodes GeoDataFrame (desde el CSV limpio)
+    gdf_nodes = _load_nodes_from_csv(stations_csv_path)
 
     # 2) build line geometries and ordering
     gdf_lines, line_orders = _build_lines_from_nodes(gdf_nodes)
@@ -374,7 +409,7 @@ def load_nyc_mta(
     # 3) build structural graph (nodes + spatial edges)
     G, node_meta = _build_graph_from_nodes_and_lines(gdf_nodes, line_orders)
 
-    # --- Si hay stop_times disponibles, calcular tiempo promedio por arista ---
+    # --- Si hay stop_times disponibles, limpiar y calcular tiempo promedio por arista ---
     # stop_times: debe contener columnas como 'trip_uid','stop_id','arrival_time','departure_time'
     # localizar stop_times/trips si no fueron provistos explícitamente
     base_dir = os.path.dirname(path)
@@ -386,20 +421,87 @@ def load_nyc_mta(
         candidates = [f for f in os.listdir(base_dir) if "trip" in f and f.endswith(".csv")]
         trips_path = os.path.join(base_dir, candidates[0]) if candidates else None
 
-    # 4) procesar stop_times (si existe)
-    _process_stop_times(stop_times_path, G, node_meta, gdf_nodes, trips_path=trips_path)
+    # 4) limpiar stop_times y trips (si existen) antes de procesar
+    reports = [stations_report]
+
+    cleaned_stop_times_path = None
+    cleaned_trips_path = None
+    trips_map = {}
+    if stop_times_path and os.path.exists(stop_times_path):
+        try:
+            station_ids = set(gdf_nodes["GTFS Stop ID"].astype(str).values)
+            cleaned_stop_times_path, stop_report = clean_stop_times(Path(stop_times_path), processed_root, station_ids, thresholds=cleaning_thresholds)
+            reports.append(stop_report)
+            print(f"[load_nyc_mta] Cleaned stop_times written to {cleaned_stop_times_path}")
+            stop_times_to_process = str(cleaned_stop_times_path)
+        except Exception as e:
+            print(f"[load_nyc_mta] Warning: failed cleaning stop_times: {e}; using raw file")
+            stop_times_to_process = stop_times_path
+    else:
+        stop_times_to_process = stop_times_path
+
+    if trips_path and os.path.exists(trips_path):
+        try:
+            cleaned_trips_path, trips_report, trips_map = clean_trips(Path(trips_path), processed_root)
+            reports.append(trips_report)
+            print(f"[load_nyc_mta] Cleaned trips written to {cleaned_trips_path}")
+        except Exception as e:
+            print(f"[load_nyc_mta] Warning: failed cleaning trips: {e}; using raw file")
+
+    # 5) procesar stop_times (si existe) usando el CSV limpio cuando esté disponible
+    _process_stop_times(stop_times_to_process, G, node_meta, gdf_nodes, trips_path=cleaned_trips_path or trips_path)
 
     metadata = {"num_nodes": G.number_of_nodes(), "num_edges": G.number_of_edges()}
 
     print(f"[load_nyc_mta] Finished. Nodes: {metadata['num_nodes']}, Edges: {metadata['num_edges']}")
 
     # guardar procesado en carpeta 'processed' junto al raw
-    processed_dir = os.path.join("src", "data", "processed")
+    # Guardar grafo procesado en la subcarpeta 'graph' dentro de processed
+    graph_dir = dirs["graph"]
     try:
-        save_processed_graph(G, gdf_nodes, gdf_lines, processed_dir)
-        print(f"[load_nyc_mta] Saved processed CSVs to {processed_dir}")
+        save_processed_graph(G, gdf_nodes, gdf_lines, str(graph_dir))
+        print(f"[load_nyc_mta] Saved processed CSVs to {graph_dir}")
     except Exception as e:
         print(f"[load_nyc_mta] Warning: failed saving processed files: {e}")
+    # Para compatibilidad con scripts existentes que esperan nodes.csv en processed/
+    try:
+        save_processed_graph(G, gdf_nodes, gdf_lines, str(dirs["root"]))
+        print(f"[load_nyc_mta] Also saved processed CSVs to {dirs['root']}")
+    except Exception:
+        pass
+
+    # Guardar manifest y reporte de calidad (aggregado)
+    try:
+        manifest = {
+            "source_files": [r.get("file") for r in reports],
+            "processing_date": pd.Timestamp.now().isoformat(),
+            "crs": "EPSG:4326",
+            "rows": {r.get("file"): {"original": r.get("original_rows"), "kept": r.get("kept_rows")} for r in reports},
+            "date_ranges": {r.get("file"): r.get("date_range") for r in reports},
+            "cleaning_thresholds": {r.get("file"): r.get("cleaning_thresholds") for r in reports},
+        }
+        write_manifest(manifest, dirs["manifests"])
+        write_quality_report({r.get("file"): r for r in reports}, dirs["metrics"])
+    except Exception as e:
+        print(f"[load_nyc_mta] Warning: failed writing manifest/quality report: {e}")
+
+    # Calcular métricas de preprocesado y resumen por ruta
+    try:
+        metrics = compute_and_save_metrics(
+            G,
+            gdf_nodes,
+            gdf_lines,
+            reports,
+            processed_root,
+            scenario_id=scenario_id,
+            select_routes=select_routes,
+            target_km=target_km,
+            curve_penalty=curve_penalty,
+            tolerance=tolerance,
+        )
+        print(f"[load_nyc_mta] Computed preprocessing metrics: {metrics}")
+    except Exception as e:
+        print(f"[load_nyc_mta] Warning: failed computing metrics: {e}")
 
 
 def visualize_nodes_edges(
@@ -489,15 +591,3 @@ def visualize_nodes_edges(
     plt.tight_layout()
     plt.show()
     return ax
-
-
-if __name__ == "__main__":
-    base = "data/rawNYC/"
-    # Ejemplo de uso
-    stations = os.path.join(base, "MTA_Subway_Stations.csv")
-    stop_times = os.path.join(base, "stop_times.csv")
-    trips = os.path.join(base, "trip_times.csv")
-    
-    load_nyc_mta(stations, stop_times_path=stop_times, trips_path=trips)
-
-    

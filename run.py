@@ -11,12 +11,12 @@ Uso:
 import argparse
 import sys
 import os
+import json
 
 from src.data.load_nyc_mta import load_nyc_mta, load_processed_gdfs, visualize_nodes_edges
 from src.main_process.route_analysis import analyze_and_select_routes, visualize_segments_csv
 
 from src.config import Config
-from src.train.trainer import train_and_evaluate
 
 
 
@@ -34,6 +34,8 @@ def parse_args():
         help="Modelo a entrenar",
     )
     parser.add_argument("--process-nyc", action="store_true", help="Procesar datos RAW de NYC y guardar en processed/")
+    parser.add_argument("--scenario-id", type=str, default="default", help="Identificador de escenario para nombres de salida")
+    parser.add_argument("--cleaning-config", type=str, default=None, help="Ruta a JSON con umbrales/configuración de limpieza")
     
     parser.add_argument("-r", "--select-routes", action="store_true", help="Seleccionar rutas 'rectas' desde processed/ y exportar CSVs")
     parser.add_argument("-k", "--target", type=float, default=10.0, help="Longitud objetivo en km (solo un valor)")
@@ -76,7 +78,7 @@ def main():
 
     config = Config(**config_kwargs)
 
-    # Si se solicita procesar los datos raw de NYC, ejecutar el pipeline y terminar
+    # Si se solicita procesar los datos raw de NYC, ejecutar el pipeline y opcionalmente análisis de rutas
     if args.process_nyc:
         base = os.path.join("src", "data")
         base_raw = os.path.join(base, "rawNYC")
@@ -84,20 +86,52 @@ def main():
         stop_times = os.path.join(base_raw, "stop_times.csv")
         trips = os.path.join(base_raw, "trip_times.csv")
 
-        path_processed = os.path.join(base, "processed")
+        processed_dir = os.path.join(base, "processed")
 
         print("[run.py] Processing raw NYC data and saving processed CSVs...")
-        
-        processed_dir = os.path.join(base, "processed")
-        if not os.path.exists(path_processed):
-            load_nyc_mta(stations, stop_times_path=stop_times, trips_path=trips)
-            # print(f"[run.py] Processed files saved to: {processed_dir}")
 
-        print("[run.py] Loading processed CSVs for visualization...")
-        gdf_nodes, gdf_lines = load_processed_gdfs(processed_dir)
+        # cargar configuración de limpieza si se proporcionó
+        cleaning_thresholds = None
+        if args.cleaning_config:
+            try:
+                with open(args.cleaning_config, "r", encoding="utf-8") as fh:
+                    cleaning_thresholds = json.load(fh)
+            except Exception as e:
+                print(f"[run.py] Warning: failed loading cleaning config {args.cleaning_config}: {e}")
 
-        print("[run.py] Visualizing processed data (loaded from CSV)...")
-        visualize_nodes_edges(gdf_nodes, gdf_lines, show_labels=False, node_size=5)
+        # Ejecutar pipeline parametrizado
+        load_nyc_mta(
+            stations,
+            stop_times_path=stop_times,
+            trips_path=trips,
+            scenario_id=args.scenario_id,
+            select_routes=None,
+            target_km=args.target,
+            curve_penalty=args.curve_penalty,
+            tolerance=args.tolerance,
+            cleaning_thresholds=cleaning_thresholds,
+        )
+
+        # Si el usuario pidió seleccionar rutas inmediatamente después, ejecutarlo
+        if args.select_routes:
+            print(f"[run.py] Running route analysis for target={args.target} km (tolerance={args.tolerance})")
+            result = analyze_and_select_routes(
+                processed_dir=processed_dir,
+                target_km=args.target,
+                tolerance=args.tolerance,
+                curvature_penalty=args.curve_penalty,
+            )
+            out_dir = result.get("out_dir")
+            file_path = result.get("file")
+            print(f"[run.py] Route analysis finished. Outputs in: {out_dir}\n    target {args.target} km -> {file_path}")
+
+        # Visualizar si se pidió
+        if args.view_file is True:
+            print("[run.py] Loading processed CSVs for visualization...")
+            gdf_nodes, gdf_lines = load_processed_gdfs(processed_dir)
+            print("[run.py] Visualizing processed data (loaded from CSV)...")
+            visualize_nodes_edges(gdf_nodes, gdf_lines, show_labels=False, node_size=5)
+
         return 0
 
     # Si se solicita seleccionar rutas (análisis del grafo), ejecutar y terminar
@@ -170,6 +204,10 @@ def main():
     print(f"  Predicción de Tiempos de Viaje — Lima Transport Network")
     print(f"  Modelo: {config.model.upper()}")
     print(f"{'='*60}\n")
+
+    # Importar el módulo de entrenamiento aquí para evitar dependencias
+    # al ejecutar herramientas de preprocesado o análisis solamente.
+    from src.train.trainer import train_and_evaluate
 
     results = train_and_evaluate(config)
 

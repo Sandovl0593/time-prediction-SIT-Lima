@@ -14,7 +14,6 @@ import torch
 import torch.nn as nn
 
 from src.config import Config
-from src.data.mock_lima_tensor import mock_lima_graph
 from src.models.graphsage_model import TravelTimeGraphSAGE
 from src.models.gat_model import TravelTimeGAT
 from src.models.gatv2_model import TravelTimeGATv2
