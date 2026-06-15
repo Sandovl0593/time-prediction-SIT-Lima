@@ -25,8 +25,7 @@ from shapely import wkt
 from src.main_process.general_pipeline import load_processed_gdfs
 
 def visualize_nodes_edges(
-    gdf_nodes: gpd.GeoDataFrame,
-    gdf_lines: gpd.GeoDataFrame,
+    processed_dir: Optional[str] = None,
     show_labels: bool = False,
     figsize: Tuple[int, int] = (10, 10),
     node_size: int = 30,
@@ -48,6 +47,14 @@ def visualize_nodes_edges(
 
     # Preparar ejes
     _, ax = plt.subplots(figsize=figsize)
+
+    proc_dir = processed_dir or os.path.join("src", "data", "processed", "graph")
+    loaded = load_processed_gdfs(proc_dir)
+    # load_processed_gdfs devuelve (gdf_nodes, gdf_lines) (posiblemente + edges_df)
+    if isinstance(loaded, tuple) and len(loaded) >= 2:
+        gdf_nodes, gdf_lines = loaded[0], loaded[1]
+    else:
+        gdf_nodes, gdf_lines = loaded
 
     # Dibujar líneas (servicios) coloreadas por 'Line' si existe la columna
     if gdf_lines is not None and not gdf_lines.empty and "Line" in gdf_lines.columns:

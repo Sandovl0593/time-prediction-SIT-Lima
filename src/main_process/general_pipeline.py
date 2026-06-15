@@ -43,7 +43,86 @@ from .cleaning import (
     write_manifest,
     write_quality_report
 )
-from sklearn.decomposition import PCA
+
+def _rustic_1d_projection(coords: np.ndarray) -> np.ndarray:
+    """Proyecta coordenadas 2D a valores 1D de forma rústica y rápida.
+
+    Estrategia: comparar la varianza en X e Y y usar la coordenada dominante
+    como valor de proyección. Es rápido (O(n)) y suficiente para trayectos
+    mayoritariamente lineales; la mejora local 2-opt posterior reduce zigzags.
+    """
+    if coords.size == 0:
+        return np.array([])
+    x = coords[:, 0]
+    y = coords[:, 1]
+    var_x = float(np.var(x))
+    var_y = float(np.var(y))
+    # elegir la coordenada con mayor varianza
+    return x if var_x >= var_y else y
+
+
+def _order_points_via_rustic_and_2opt(coords: np.ndarray, max_iter: int = 3) -> np.ndarray:
+    """Ordena índices de puntos 2D usando una proyección rústica + 2-opt.
+
+    Args:
+        coords: array (N,2) con coordenadas proyectadas (métricas).
+        max_iter: número máximo de iteraciones de mejora 2-opt.
+
+    Returns:
+        array de índices (longitud N) que indica el nuevo orden.
+    """
+    n = coords.shape[0]
+    if n <= 2:
+        return np.arange(n)
+
+    # Inicializar con proyección rústica (coordenada dominante)
+    proj = _rustic_1d_projection(coords)
+    asc = np.argsort(proj)
+    desc = asc[::-1]
+
+    def path_length(order_idx: np.ndarray) -> float:
+        pts = coords[order_idx]
+        dif = np.diff(pts, axis=0)
+        return float(np.sum(np.sqrt((dif ** 2).sum(axis=1))))
+
+    # Escoger la orientación (asc/desc) con menor longitud inicial
+    best = asc
+    best_len = path_length(asc)
+    rev_len = path_length(desc)
+    if rev_len < best_len:
+        best = desc
+        best_len = rev_len
+
+    order = list(best)
+
+    # Mejora local 2-opt (open path)
+    it = 0
+    improved = True
+    while improved and it < max_iter:
+        improved = False
+        it += 1
+        for i in range(0, n - 2):
+            for j in range(i + 1, n - 1):
+                # Consider edges (i,i+1) and (j,j+1)
+                a = coords[order[i]]
+                b = coords[order[i + 1]]
+                c = coords[order[j]]
+                d = coords[order[j + 1]]
+                cur = np.linalg.norm(a - b) + np.linalg.norm(c - d)
+                new = np.linalg.norm(a - c) + np.linalg.norm(b - d)
+                if new + 1e-9 < cur:
+                    # Revertir segmento (i+1 .. j) inclusive
+                    order[i + 1 : j + 1] = list(reversed(order[i + 1 : j + 1]))
+                    improved = True
+                    break
+            if improved:
+                break
+
+    return np.array(order, dtype=int)
+
+
+# La implementación anterior basada en PCA fue eliminada; usar
+# _order_points_via_rustic_and_2opt junto con _rustic_1d_projection.
 
 def _load_nodes_from_csv(path: str) -> gpd.GeoDataFrame:
     print(f"[load_nyc_mta] Reading stations CSV from {path}")
@@ -80,10 +159,16 @@ def _build_lines_from_nodes(gdf_nodes: gpd.GeoDataFrame):
         if len(sub) < 2:
             continue
         coords = np.vstack([sub["_x"].values, sub["_y"].values]).T
-        pca = PCA(n_components=1)
-        proj = pca.fit_transform(coords).ravel()
-        order = np.argsort(proj)
-        ordered = sub.iloc[order]
+
+        # Orden inicial rústico + refinamiento 2-opt para evitar zigzags
+        try:
+            order = _order_points_via_rustic_and_2opt(coords, max_iter=3)
+            ordered = sub.iloc[order]
+        except Exception:
+            # Fallback simple si algo falla: ordenar por coordenada dominante
+            proj = _rustic_1d_projection(coords)
+            order = np.argsort(proj)
+            ordered = sub.iloc[order]
         line_orders.append((line_name, ordered))
 
         # crear LineString en WGS84 (lon, lat)
