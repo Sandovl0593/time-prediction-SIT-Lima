@@ -61,7 +61,10 @@ def _rustic_1d_projection(coords: np.ndarray) -> np.ndarray:
     return x if var_x >= var_y else y
 
 
-def _order_points_via_rustic_and_2opt(coords: np.ndarray, max_iter: int = 3) -> np.ndarray:
+def _order_points_via_rustic_and_2opt(
+    coords: np.ndarray,
+    max_iter: int = 3
+) -> np.ndarray:
     """Ordena índices de puntos 2D usando una proyección rústica + 2-opt.
 
     Args:
@@ -230,7 +233,13 @@ def _build_graph_from_nodes_and_lines(gdf_nodes: gpd.GeoDataFrame, line_orders):
     return G, node_meta
 
 
-def _process_stop_times(stop_times_path: str, G: nx.MultiDiGraph, node_meta: dict, gdf_nodes: gpd.GeoDataFrame, trips_path: Optional[str] = None):
+def _process_stop_times(
+    stop_times_path: str, 
+    G: nx.MultiDiGraph,
+    node_meta: dict,
+    gdf_nodes: gpd.GeoDataFrame,
+    trips_path: Optional[str] = None
+):
     if stop_times_path is None:
         print("[load_nyc_mta] No stop_times file provided; skipping observed travel-time processing")
         return
@@ -338,7 +347,12 @@ def _process_stop_times(stop_times_path: str, G: nx.MultiDiGraph, node_meta: dic
     print(f"[load_nyc_mta] Added {len(travel_acc)} observed edges to graph")
 
 
-def save_processed_graph(G: nx.MultiDiGraph, gdf_nodes: gpd.GeoDataFrame, gdf_lines: gpd.GeoDataFrame, out_dir: str):
+def save_processed_graph(
+    G: nx.MultiDiGraph,
+    gdf_nodes: gpd.GeoDataFrame,
+    gdf_lines: gpd.GeoDataFrame,
+    out_dir: str
+):
     """Guarda nodos, aristas y líneas procesadas en CSV dentro de `out_dir`.
 
     - nodes.csv: contiene atributos de nodos (incluye lon/lat y geometry_wkt)
@@ -443,7 +457,14 @@ def load_processed_gdfs(processed_dir: str) -> Tuple[gpd.GeoDataFrame, gpd.GeoDa
     return gdf_nodes, gdf_lines
 
 
-def compute_and_save_metrics(G, gdf_nodes: gpd.GeoDataFrame, gdf_lines: gpd.GeoDataFrame, reports: List[Dict[str, Any]], processed_root: Path, scenario_id: str = "default", select_routes: Optional[List[str]] = None, target_km: Optional[float] = None, curve_penalty: Optional[float] = None, tolerance: Optional[float] = None) -> Dict[str, Any]:
+def compute_and_save_metrics(
+    G: nx.MultiDiGraph,
+    gdf_lines: gpd.GeoDataFrame,
+    scenario_id: str = "default",
+    target_km: Optional[float] = None,
+    curve_penalty: Optional[float] = None,
+    tolerance: Optional[float] = None
+) -> Dict[str, Any]:
     """Computa métricas simples de preprocesado y guarda CSVs resumidos."""
     metrics = {
         "num_nodes": int(G.number_of_nodes()) if G is not None else 0,
@@ -502,7 +523,7 @@ def compute_and_save_metrics(G, gdf_nodes: gpd.GeoDataFrame, gdf_lines: gpd.GeoD
 
                     straightness_c = (chord / path_len) if path_len > 0 else 0.0
                     score = straightness_c - (float(curve_penalty) * (abs(length_real_km - float(target_km)) / (float(target_km) + 1e-9))) if target_km is not None and curve_penalty is not None else straightness_c
-
+                    
                     seg_geom = LineString(coords_lonlat[i:j+1])
                     route_metrics_rows.append({
                         "line": row.get("Line", ""),
@@ -791,12 +812,9 @@ def general_pipeline(
     try:
         metrics = compute_and_save_metrics(
             G,
-            gdf_nodes,
             gdf_lines,
-            reports,
-            processed_root,
             scenario_id=scenario_id,
-            target_km=target_km,    
+            target_km=target_km,
             curve_penalty=curve_penalty,
             tolerance=tolerance,
         )

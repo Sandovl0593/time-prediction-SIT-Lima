@@ -117,10 +117,24 @@ def visualize_nodes_edges(
     ax.set_axis_off()
     plt.tight_layout()
     plt.show()
-    return ax
 
 
-def visualize_segments_csv(csv_path: str, processed_dir: Optional[str] = None, show_nodes: bool = True, figsize: Tuple[int, int] = (10, 10)) -> None:
+# def visualize_topk_csv(topk_csv_path: str, processed_dir: Optional[str] = None, show_nodes: bool = True, figsize: Tuple[int, int] = (10, 10)) -> None:
+#     """Convenience wrapper to visualize a top-k CSV produced by `src/routes/export_top_segments.py`.
+
+#     This function simply forwards parameters to `visualize_segments_csv`, and
+#     exists to make intent explicit when visualizing exported top-k files.
+#     """
+#     return visualize_segments_csv(topk_csv_path, processed_dir=processed_dir, show_nodes=show_nodes, figsize=figsize)
+
+
+def visualize_segments_csv(
+    csv_path: str,
+    processed_dir: Optional[str] = None,
+    show_nodes: bool = True, 
+    figsize: Tuple[int, int] = (10, 10),
+    # top_segments: Optional[int] = 10
+) -> None:
     """Visualiza un CSV generado por `analyze_and_select_routes` sin re-ejecutar la búsqueda.
 
     Args:
@@ -142,6 +156,13 @@ def visualize_segments_csv(csv_path: str, processed_dir: Optional[str] = None, s
 
     df["geometry"] = df["geometry_wkt"].apply(lambda s: wkt.loads(s) if pd.notna(s) and s != "" else None)
     gdf = gpd.GeoDataFrame(df, geometry="geometry", crs="EPSG:4326")
+    gdf = gdf.reset_index(drop=True)
+
+    # # Si se pide limitar el número de tramos a visualizar, muestre una muestra aleatoria
+    # if top_segments is not None and top_segments > 0:
+    #     if len(gdf) > top_segments:
+    #         gdf = gdf.sample(n=top_segments).reset_index(drop=True)
+    #     else:
 
     fig, ax = plt.subplots(figsize=figsize)
     # fondo: líneas procesadas si se dispone
@@ -155,42 +176,29 @@ def visualize_segments_csv(csv_path: str, processed_dir: Optional[str] = None, s
         except Exception:
             pass
 
-    # Preferir colorear por `line` (ruta). Si no existe, usar `target_km`,
-    # y en último caso pintar todo de rojo.
-    plotted = False
-    # if "line" in gdf.columns:
-    uniques = list(gdf["line"].dropna().unique())
-    n = len(uniques)
-    # Elegir un mapa con suficientes colores; tab20 cubre hasta 20 rutas.
-    if n <= 10:
-        cmap = plt.get_cmap("tab10")
-        palette_size = 10
-    elif n <= 20:
-        cmap = plt.get_cmap("tab20")
-        palette_size = 20
-    else:
-        cmap = plt.get_cmap("hsv")
-        palette_size = n
+    # Colorear por fila (cada tramo) en lugar de agrupar por línea completa.
+    n = len(gdf)
+    if n > 0:
+        import matplotlib.colors as mcolors
 
-    mapping = {u: cmap(i % palette_size / max(1, palette_size - 1)) for i, u in enumerate(uniques)}
-    for u, color in mapping.items():
-        subset = gdf[gdf["line"] == u]
-        if not subset.empty:
-            subset.plot(ax=ax, linewidth=2.5, color=color, zorder=3, label=str(u))
-            plotted = True
-    if plotted:
-        ax.legend(title="line", fontsize="small", markerscale=2, loc="best")
-    # elif "target_km" in gdf.columns:
-    #     uniques = sorted(gdf["target_km"].dropna().unique())
-    #     cmap = plt.get_cmap("tab10")
-    #     mapping = {u: cmap(i % 10) for i, u in enumerate(uniques)}
-    #     for u, color in mapping.items():
-    #         subset = gdf[gdf["target_km"] == u]
-    #         if not subset.empty:
-    #             subset.plot(ax=ax, linewidth=2.5, color=color, zorder=3)
-    # else:
-    #     gdf.plot(ax=ax, linewidth=2.5, color="red", zorder=3)
+        if n <= 10:
+            cmap = plt.get_cmap("tab10")
+            palette_size = 10
+        elif n <= 20:
+            cmap = plt.get_cmap("tab20")
+            palette_size = 20
+        else:
+            cmap = plt.get_cmap("hsv")
+            palette_size = n
 
+        colors = [mcolors.to_hex(cmap(i % max(1, palette_size - 1) / max(1, palette_size - 1))) for i in range(n)]
+
+        # Dibujar cada fila por separado con su color
+        for i in range(n):
+            subset = gdf.iloc[[i]]
+            color = colors[i]
+            subset.plot(ax=ax, linewidth=2.5, color=color, zorder=3)
+        
     ax.set_axis_off()
     plt.tight_layout()
     plt.show()
