@@ -128,12 +128,12 @@ def _order_points_via_rustic_and_2opt(
 # _order_points_via_rustic_and_2opt junto con _rustic_1d_projection.
 
 def _load_nodes_from_csv(path: str) -> gpd.GeoDataFrame:
-    print(f"[load_nyc_mta] Reading stations CSV from {path}")
+    print(f"[gen_pipeline] Reading stations CSV from {path}")
     df = pd.read_csv(path)
     # Eliminar completamente las columnas 'CBD' y 'Borough' por petición del usuario.
     for c in ["CBD", "Borough"]:
         if c in df.columns:
-            print(f"[load_nyc_mta] Dropping column '{c}' as requested by user")
+            print(f"[gen_pipeline] Dropping column '{c}' as requested by user")
             df = df.drop(columns=[c])
     stop_id_col = "GTFS Stop ID"
     lat_col = "GTFS Latitude"
@@ -143,7 +143,7 @@ def _load_nodes_from_csv(path: str) -> gpd.GeoDataFrame:
         df.copy(), geometry=gpd.points_from_xy(df[lon_col], df[lat_col]), crs="EPSG:4326"
     )
 
-    print("[load_nyc_mta] Projecting to metric CRS for distance calculations")
+    print("[gen_pipeline] Projecting to metric CRS for distance calculations")
     gdf_proj = gdf_nodes.to_crs(epsg=3857)
     gdf_nodes["_x"] = gdf_proj.geometry.x
     gdf_nodes["_y"] = gdf_proj.geometry.y
@@ -154,7 +154,7 @@ def _load_nodes_from_csv(path: str) -> gpd.GeoDataFrame:
 
 
 def _build_lines_from_nodes(gdf_nodes: gpd.GeoDataFrame):
-    print("[load_nyc_mta] Building LineString geometries per 'Line' (assume header exists)")
+    print("[gen_pipeline] Building LineString geometries per 'Line' (assume header exists)")
     lines = []
     line_orders = []  # list of (line_name, ordered_gdf)
     for line_name, sub in gdf_nodes.groupby("Line"):
@@ -184,7 +184,7 @@ def _build_lines_from_nodes(gdf_nodes: gpd.GeoDataFrame):
 
 
 def _build_graph_from_nodes_and_lines(gdf_nodes: gpd.GeoDataFrame, line_orders):
-    print("[load_nyc_mta] Building NetworkX MultiDiGraph with node attributes")
+    print("[gen_pipeline] Building NetworkX MultiDiGraph with node attributes")
     G = nx.MultiDiGraph()
 
     node_meta = {}
@@ -197,14 +197,14 @@ def _build_graph_from_nodes_and_lines(gdf_nodes: gpd.GeoDataFrame, line_orders):
             "y": float(row["_y"]),
             # 'Borough' and 'CBD' fueron descartados antes de la ingestión
             # y por tanto no se incluyen como atributos de nodo.
-            "lines": row.get("Line"),
+            "line": row.get("Line"),
             "structure": row.get("Structure", "unknown"),
             "geometry": row.geometry,
         }
         G.add_node(node_id, **attrs)
         node_meta[node_id] = attrs
 
-    print("[load_nyc_mta] Adding spatial edges between consecutive stations per line")
+    print("[gen_pipeline] Adding spatial edges between consecutive stations per line")
     for line_name, ordered in line_orders:
         prev_id = None
         prev_row = None
@@ -241,14 +241,14 @@ def _process_stop_times(
     trips_path: Optional[str] = None
 ):
     if stop_times_path is None:
-        print("[load_nyc_mta] No stop_times file provided; skipping observed travel-time processing")
+        print("[gen_pipeline] No stop_times file provided; skipping observed travel-time processing")
         return
 
     if not os.path.exists(stop_times_path):
-        print(f"[load_nyc_mta] stop_times file not found at {stop_times_path}; skipping")
+        print(f"[gen_pipeline] stop_times file not found at {stop_times_path}; skipping")
         return
 
-    print(f"[load_nyc_mta] Processing stop_times from {stop_times_path}")
+    print(f"[gen_pipeline] Processing stop_times from {stop_times_path}")
     st = pd.read_csv(stop_times_path, dtype={"stop_id": str})
     st_cols = {c.lower(): c for c in st.columns}
     trip_col = st_cols.get("trip_uid") or st_cols.get("trip_id")
@@ -282,7 +282,7 @@ def _process_stop_times(
 
     trips_map = {}
     if trips_path and os.path.exists(trips_path):
-        print(f"[load_nyc_mta] Reading trips file from {trips_path}")
+        print(f"[gen_pipeline] Reading trips file from {trips_path}")
         trips_df = pd.read_csv(trips_path, dtype={})
         tcols = {c.lower(): c for c in trips_df.columns}
         t_trip_col = tcols.get("trip_uid") or tcols.get("trip_id")
@@ -298,7 +298,7 @@ def _process_stop_times(
         st["_order_time"] = np.nan
 
     st_order = st[st["_order_time"].notna()].copy()
-    print(f"[load_nyc_mta] Found {len(st_order)} stop_time records with valid times for processing")
+    print(f"[gen_pipeline] Found {len(st_order)} stop_time records with valid times for processing")
 
     travel_acc = defaultdict(list)
 
@@ -330,7 +330,7 @@ def _process_stop_times(
 
             prev = curr_stop
             prev_times = {"arr": curr_arr if not pd.isna(curr_arr) else None, "dep": curr_dep if not pd.isna(curr_dep) else None}
-    print(f"[load_nyc_mta] Processed stop_times for {len(travel_acc)} observed edges")
+    print(f"[gen_pipeline] Processed stop_times for {len(travel_acc)} observed edges")
 
     for (u, v, route_id_val), deltas in travel_acc.items():
         if not deltas:
@@ -344,7 +344,7 @@ def _process_stop_times(
             dist_m = float(np.sqrt(dx * dx + dy * dy))
             geom = LineString([(u_meta["lon"], u_meta["lat"]), (v_meta["lon"], v_meta["lat"])])
             G.add_edge(u, v, route_id=route_id_val, travel_time_s=avg, length_m=dist_m, geometry=geom, observed=True)
-    print(f"[load_nyc_mta] Added {len(travel_acc)} observed edges to graph")
+    print(f"[gen_pipeline] Added {len(travel_acc)} observed edges to graph")
 
 
 def save_processed_graph(
@@ -594,7 +594,7 @@ def general_pipeline(
             'Line', 'Complex ID', 'Daytime Routes', 'Borough', 'CBD'.
     """
  
-    print(f"[load_nyc_mta] Starting load for {path}")
+    print(f"[gen_pipeline] Starting load for {path}")
 
     # Preparar directorios procesados
     processed_root = Path("src") / "data" / "processed"
@@ -614,16 +614,16 @@ def general_pipeline(
     if cleaned_stations_path.exists():
         stations_csv_path = str(cleaned_stations_path)
         stations_report = {"file": cleaned_stations_path.name, "note": "skipped_cleaning_exists", "out_path": str(cleaned_stations_path)}
-        print(f"[load_nyc_mta] Found existing cleaned stations at {cleaned_stations_path}; skipping cleaning")
+        print(f"[gen_pipeline] Found existing cleaned stations at {cleaned_stations_path}; skipping cleaning")
         reports.append(stations_report)
     else:
         try:
             cleaned_stations_path, stations_report = clean_stations(Path(path), processed_root, thresholds=cleaning_thresholds)
             stations_csv_path = str(cleaned_stations_path)
-            print(f"[load_nyc_mta] Cleaned stations written to {cleaned_stations_path}")
+            print(f"[gen_pipeline] Cleaned stations written to {cleaned_stations_path}")
             reports.append(stations_report)
         except Exception as e:
-            print(f"[load_nyc_mta] Warning: failed cleaning stations: {e}; falling back to raw file")
+            print(f"[gen_pipeline] Warning: failed cleaning stations: {e}; falling back to raw file")
             stations_report = {"file": Path(path).name, "original_rows": None}
             stations_csv_path = path
             reports.append(stations_report)
@@ -635,11 +635,11 @@ def general_pipeline(
     graph_lines_csv = graph_dir / "lines.csv"
 
     if graph_nodes_csv.exists() and graph_edges_csv.exists() and graph_lines_csv.exists():
-        print(f"[load_nyc_mta] Found existing processed graph in {graph_dir}; loading instead of rebuilding")
+        print(f"[gen_pipeline] Found existing processed graph in {graph_dir}; loading instead of rebuilding")
         # load_processed_gdfs devuelve gdf_nodes, gdf_lines
         gdf_nodes, gdf_lines = load_processed_gdfs(str(graph_dir))
         # Reconstruir G a partir de nodes/edges CSVs
-        print("[load_nyc_mta] Reconstructing NetworkX graph from CSVs")
+        print("[gen_pipeline] Reconstructing NetworkX graph from CSVs")
         G = nx.MultiDiGraph()
         node_meta = {}
         for _, row in gdf_nodes.iterrows():
@@ -704,7 +704,7 @@ def general_pipeline(
                 else:
                     G.add_edge(u, v, **edata)
         except Exception as e:
-            print(f"[load_nyc_mta] Warning: failed reading edges.csv: {e}; graph may be incomplete")
+            print(f"[gen_pipeline] Warning: failed reading edges.csv: {e}; graph may be incomplete")
 
     else:
         gdf_nodes = _load_nodes_from_csv(stations_csv_path)
@@ -744,7 +744,7 @@ def general_pipeline(
                 trips_map = dict(zip(trips_df[t_trip_col].astype(str), trips_df[route_col].astype(str)))
             trips_report = {"file": cleaned_trips_path.name, "note": "skipped_cleaning_exists", "out_path": str(cleaned_trips_path)}
             reports.append(trips_report)
-            print(f"[load_nyc_mta] Found existing cleaned trips at {cleaned_trips_path}; skipping cleaning")
+            print(f"[gen_pipeline] Found existing cleaned trips at {cleaned_trips_path}; skipping cleaning")
         except Exception:
             trips_map = {}
     else:
@@ -752,26 +752,26 @@ def general_pipeline(
             try:
                 cleaned_trips_path, trips_report, trips_map = clean_trips(Path(trips_path), processed_root)
                 reports.append(trips_report)
-                print(f"[load_nyc_mta] Cleaned trips written to {cleaned_trips_path}")
+                print(f"[gen_pipeline] Cleaned trips written to {cleaned_trips_path}")
             except Exception as e:
-                print(f"[load_nyc_mta] Warning: failed cleaning trips: {e}; using raw file")
+                print(f"[gen_pipeline] Warning: failed cleaning trips: {e}; using raw file")
 
     # Luego stop_times: preferir archivo limpio existente si está presente
     if cleaned_stop_times_path.exists():
         stop_times_to_process = str(cleaned_stop_times_path)
         stop_report = {"file": cleaned_stop_times_path.name, "note": "skipped_cleaning_exists", "out_path": str(cleaned_stop_times_path)}
         reports.append(stop_report)
-        print(f"[load_nyc_mta] Found existing cleaned stop_times at {cleaned_stop_times_path}; skipping cleaning")
+        print(f"[gen_pipeline] Found existing cleaned stop_times at {cleaned_stop_times_path}; skipping cleaning")
     else:
         if stop_times_path and os.path.exists(stop_times_path):
             try:
                 station_ids = set(gdf_nodes["GTFS Stop ID"].astype(str).values)
                 cleaned_stop_times_path, stop_report = clean_stop_times(Path(stop_times_path), processed_root, station_ids, thresholds=cleaning_thresholds, trips_map=trips_map if trips_map else None)
                 reports.append(stop_report)
-                print(f"[load_nyc_mta] Cleaned stop_times written to {cleaned_stop_times_path}")
+                print(f"[gen_pipeline] Cleaned stop_times written to {cleaned_stop_times_path}")
                 stop_times_to_process = str(cleaned_stop_times_path)
             except Exception as e:
-                print(f"[load_nyc_mta] Warning: failed cleaning stop_times: {e}; using raw file")
+                print(f"[gen_pipeline] Warning: failed cleaning stop_times: {e}; using raw file")
                 stop_times_to_process = stop_times_path
         else:
             stop_times_to_process = stop_times_path
@@ -781,16 +781,16 @@ def general_pipeline(
 
     metadata = {"num_nodes": G.number_of_nodes(), "num_edges": G.number_of_edges()}
 
-    print(f"[load_nyc_mta] Finished. Nodes: {metadata['num_nodes']}, Edges: {metadata['num_edges']}")
+    print(f"[gen_pipeline] Finished. Nodes: {metadata['num_nodes']}, Edges: {metadata['num_edges']}")
 
     # guardar procesado en carpeta 'processed' junto al raw
     # Guardar grafo procesado en la subcarpeta 'graph' dentro de processed
     graph_dir = dirs["graph"]
     try:
         save_processed_graph(G, gdf_nodes, gdf_lines, str(graph_dir))
-        print(f"[load_nyc_mta] Saved processed CSVs to {graph_dir}")
+        print(f"[gen_pipeline] Saved processed CSVs to {graph_dir}")
     except Exception as e:
-        print(f"[load_nyc_mta] Warning: failed saving processed files: {e}")
+        print(f"[gen_pipeline] Warning: failed saving processed files: {e}")
     # Graph CSVs are saved only in the `graph/` subdirectory to avoid duplication
 
     # Guardar manifest y reporte de calidad (aggregado)
@@ -806,7 +806,7 @@ def general_pipeline(
         write_manifest(manifest, dirs["manifests"])
         write_quality_report({r.get("file"): r for r in reports}, dirs["metrics"])
     except Exception as e:
-        print(f"[load_nyc_mta] Warning: failed writing manifest/quality report: {e}")
+        print(f"[gen_pipeline] Warning: failed writing manifest/quality report: {e}")
 
     # Calcular métricas de preprocesado y resumen por ruta
     try:
@@ -818,6 +818,6 @@ def general_pipeline(
             curve_penalty=curve_penalty,
             tolerance=tolerance,
         )
-        print(f"[load_nyc_mta] Computed preprocessing metrics: {metrics}")
+        print(f"[gen_pipeline] Computed preprocessing metrics: {metrics}")
     except Exception as e:
-        print(f"[load_nyc_mta] Warning: failed computing metrics: {e}")
+        print(f"[gen_pipeline] Warning: failed computing metrics: {e}")
