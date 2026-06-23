@@ -12,7 +12,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 
-
 class TravelTimeGAT(nn.Module):
     """GAT encoder + edge-level MLP decoder para regresión de tiempos.
 
@@ -73,7 +72,11 @@ class TravelTimeGAT(nn.Module):
             self.norms.append(nn.BatchNorm1d(hidden_dim))
 
         # Decoder MLP para predecir tiempo de viaje por arista
-        decoder_in = hidden_dim * 2 + edge_attr_dim
+        self.encoder_out_dim = hidden_dim
+        decoder_in = (
+            self.encoder_out_dim * 2
+            + edge_attr_dim
+        )
         self.decoder = nn.Sequential(
             nn.Linear(decoder_in, hidden_dim),
             nn.ReLU(),
@@ -88,8 +91,8 @@ class TravelTimeGAT(nn.Module):
         for i, (conv, norm) in enumerate(zip(self.convs, self.norms)):
             x = conv(x, edge_index)
             x = norm(x)
-            x = F.elu(x)
             if i < len(self.convs) - 1:
+                x = F.elu(x)
                 x = F.dropout(x, p=self.dropout, training=self.training)
         return x
 

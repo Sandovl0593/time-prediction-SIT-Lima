@@ -1,7 +1,7 @@
 """Configuración unificada para todos los modelos."""
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass
@@ -26,31 +26,49 @@ class Config:
         device: Dispositivo de cómputo ('cpu' o 'cuda').
     """
 
-    model: str = "gat"
-    hidden_dim: int = 64
+    # ---------- Paths ----------
+    data_dir = Path("src/data/processed")
+    graph_dir = data_dir / "graph"
+    # ---------- Model ----------
+    model: str = "gatv2"      # graphsage | gat | gatv2
+    hidden_dim: int = 128
     num_layers: int = 2
     heads: int = 4
-    gru_hidden_dim: int = 64
-    gru_num_layers: int = 1
-    dropout: float = 0.1
-    lr: float = 0.001
+    dropout: float = 0.2
+    # ---------- Training ----------
+    epochs: int = 200
+    learning_rate: float = 1e-3
     weight_decay: float = 1e-5
-    epochs: int = 100
-    seed: int = 42
-    test_ratio: float = 0.2
-    num_time_steps: int = 12
-    device: str = "cpu"
 
-    # Limitado a los tres encoders que vamos a considerar.
+    train_ratio: float = 0.7
+    val_ratio: float = 0.15
+    test_ratio: float = 0.15
+    batch_size: int = 1
+    seed: int = 42
+
+    # ---------- Early stopping ----------
+    patience: int = 25
+    # ---------- Logs ----------
+    eval_every: int = 5
+    print_every: int = 1
+
+    device: str = "cuda"
+
     VALID_MODELS = (
-        "gat", "gatv2", "graphsage",
+        "graphsage",
+        "gat",
+        "gatv2"
     )
 
     def __post_init__(self):
+        self.model = self.model.lower()
         if self.model not in self.VALID_MODELS:
             raise ValueError(
-                f"Modelo '{self.model}' no válido. "
-                f"Opciones: {self.VALID_MODELS}"
+                f"Modelo inválido {self.model}"
+            )
+        if self.model in ["gat", "gatv2"] and self.num_layers < 2:
+            raise ValueError(
+                "GAT y GATv2 requieren num_layers>=2"
             )
 
     @classmethod

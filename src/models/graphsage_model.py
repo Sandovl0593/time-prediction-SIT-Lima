@@ -65,8 +65,8 @@ class TravelTimeGraphSAGE(nn.Module):
         for i, (conv, norm) in enumerate(zip(self.convs, self.norms)):
             x = conv(x, edge_index)
             x = norm(x)
-            x = F.relu(x)
             if i < len(self.convs) - 1:
+                x = F.relu(x)
                 x = F.dropout(x, p=self.dropout, training=self.training)
         return x
 

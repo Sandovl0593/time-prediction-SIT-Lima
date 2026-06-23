@@ -15,6 +15,7 @@ import json
 
 from src.main_process.general_pipeline import general_pipeline, load_processed_gdfs
 from src.main_process.visualize import visualize_segments_csv, visualize_nodes_edges
+from src.train.trainer import train_and_evaluate
 
 from src.config import Config
 
@@ -46,21 +47,21 @@ def parse_args():
     parser.add_argument("-t", "--tolerance", type=float, default=0.25, help="Tolerancia relativa para distancia objetivo (fracción)")
     parser.add_argument("-n", "--n-segments", type=int, default=None, help="Número de tramos del top a visualizar (solo para --view-file)")
     
-    parser.add_argument("--hidden_dim", type=int, default=None, help="Dimensión oculta")
-    parser.add_argument("--num_layers", type=int, default=None, help="Capas del encoder de grafos")
-    parser.add_argument("--dropout", type=float, default=None, help="Dropout rate")
-    parser.add_argument("--lr", type=float, default=None, help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=None, help="L2 regularization")
-    parser.add_argument("--epochs", type=int, default=None, help="Número de épocas")
-    parser.add_argument("--seed", type=int, default=None, help="Semilla aleatoria")
-    parser.add_argument("--num_time_steps", type=int, default=None, help="Pasos temporales (GRU)")
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        choices=["cpu", "cuda"],
-        help="Dispositivo de cómputo",
-    )
+    # parser.add_argument("--hidden_dim", type=int, default=None, help="Dimensión oculta")
+    # parser.add_argument("--num_layers", type=int, default=None, help="Capas del encoder de grafos")
+    # parser.add_argument("--dropout", type=float, default=None, help="Dropout rate")
+    # parser.add_argument("--lr", type=float, default=None, help="Learning rate")
+    # parser.add_argument("--weight_decay", type=float, default=None, help="L2 regularization")
+    # parser.add_argument("--epochs", type=int, default=None, help="Número de épocas")
+    # parser.add_argument("--seed", type=int, default=None, help="Semilla aleatoria")
+    # parser.add_argument("--num_time_steps", type=int, default=None, help="Pasos temporales (GRU)")
+    # parser.add_argument(
+    #     "--device",
+    #     type=str,
+    #     default=None,
+    #     choices=["cpu", "cuda"],
+    #     help="Dispositivo de cómputo",
+    # )
 
     return parser.parse_args()
 
@@ -68,18 +69,23 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Construir config, solo sobrescribir valores explícitos
-    config_kwargs = {"model": args.model}
-    for key in [
-        "hidden_dim", "num_layers",
-        "dropout", "lr", "weight_decay", "epochs", "seed", "num_time_steps",
-        "device",
-    ]:
-        val = getattr(args, key)
-        if val is not None:
-            config_kwargs[key] = val
+    if args.model:
+        # Construir config, solo sobrescribir valores explícitos
+        config_kwargs = {"model": args.model}
+        for key in [
+            "hidden_dim", "num_layers",
+            "dropout", "lr", "weight_decay", "epochs", "seed", "num_time_steps",
+            "device",
+        ]:
+            val = getattr(args, key)
+            if val is not None:
+                config_kwargs[key] = val
 
-    config = Config(**config_kwargs)
+        config = Config(**config_kwargs)
+
+        # Process the model training and evaluation if not in a special mode
+        if not (args.process_nyc or args.view_file or args.show_processed):
+            train_and_evaluate(config)
 
     # Si se solicita procesar los datos raw de NYC, ejecutar el pipeline y opcionalmente análisis de rutas
     if args.process_nyc:
