@@ -1,0 +1,10 @@
+2026-06-24 14:51:43,905 INFO [gen_pipeline] Starting pipeline for src\data\rawNYC\MTA_Subway_Stations.csv | scenario_id=base
+2026-06-24 14:51:44,031 INFO [gen_pipeline] Cleaned stations written to src\data\processed\cleaned\cleaned_stations.csv
+2026-06-24 14:51:44,413 INFO [gen_pipeline] Cleaned trips written to src\data\processed\cleaned\cleaned_trip_times.csv
+2026-06-24 14:51:46,207 INFO [gen_pipeline] Cleaned stop_times written to src\data\processed\cleaned\cleaned_stop_times.csv
+2026-06-24 14:51:59,238 INFO [gen_pipeline] Finished. Nodes: 496, Edges: 1896
+2026-06-24 14:51:59,305 INFO [gen_pipeline] Saved processed CSVs to src\data\processed\graph
+2026-06-24 14:51:59,626 INFO [compute_and_save_metrics] route_candidates.csv actualizado: 5483 filas totales (5483 nuevas para 'base')
+2026-06-24 14:51:59,630 INFO [gen_pipeline] Computed preprocessing metrics: {'num_nodes': 496, 'num_edges': 1896, 'processing_date': '2026-06-24T14:51:59.314403', 'route_candidates_path': 'src\\outputs\\routes\\route_candidates.csv', 'route_count_by_scenario': 5483, 'accepted_count': 4421}
+2026-06-24 14:51:59,635 INFO [gen_pipeline] Saved JSON reports to src\data\processed\metrics
+2026-06-24 14:51:59,635 INFO [gen_pipeline] Pipeline completed in 15.7s

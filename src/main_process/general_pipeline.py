@@ -16,17 +16,14 @@ from typing import Any, Dict, Tuple, Optional, List
 from pathlib import Path
 import os
 import re
+import time
+import json
 from collections import defaultdict
 import logging
 
-# configurar logger simple para información durante el preprocesado
-logger = logging.getLogger("data_cleaning")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("[cleaning] %(levelname)s: %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+from src.utils.others import get_logger
+
+logger = get_logger("data_cleaning")
 
 import pandas as pd
 import geopandas as gpd
@@ -457,29 +454,50 @@ def load_processed_gdfs(processed_dir: str) -> Tuple[gpd.GeoDataFrame, gpd.GeoDa
     return gdf_nodes, gdf_lines
 
 
+_KM_BINS_DEFAULT: List[float] = [1.0, 2.0, 5.0, 10.0, 15.0, 20.0]
+
+
+def _nearest_km_bin(km: float, bins: List[float]) -> float:
+    """Devuelve el bin de km más cercano a `km` (tol_prox)."""
+    return float(min(bins, key=lambda b: abs(km - b)))
+
+
 def compute_and_save_metrics(
     G: nx.MultiDiGraph,
     gdf_lines: gpd.GeoDataFrame,
-    scenario_id: str = "default",
-    target_km: Optional[float] = None,
-    curve_penalty: Optional[float] = None,
-    tolerance: Optional[float] = None
+    scenario_id: str = "base",
+    # km_bins: Optional[List[float]] = None,
+    base_curve_penalty: float = 0.5,
+    base_km_tolerance_ratio: float = 0.3,
 ) -> Dict[str, Any]:
-    """Computa métricas simples de preprocesado y guarda CSVs resumidos."""
+    """Computa métricas del grafo y escribe el CSV maestro de rutas candidatas.
+
+    Todos los escenarios acumulan sus filas en un único archivo maestro:
+        src/outputs/routes/route_candidates.csv
+
+    Para cada subtramo se calcula:
+    - tol_prox  : bin km más cercano de [1, 2, 5, 10, 15, 20]
+    - km_offset : length_real_km − tol_prox  (diferencia signed respecto al criterio)
+    - score     : straightness_c − base_curve_penalty · |km_offset| / (tol_prox + ε)
+    - accepted_by_tolerance : |km_offset| / tol_prox ≤ base_km_tolerance_ratio
+
+    Si el archivo maestro ya existe y contiene filas para este scenario_id,
+    esas filas se eliminan antes de escribir las nuevas.
+    """
+    _bins = _KM_BINS_DEFAULT
+
     metrics = {
         "num_nodes": int(G.number_of_nodes()) if G is not None else 0,
         "num_edges": int(G.number_of_edges()) if G is not None else 0,
         "processing_date": pd.Timestamp.now().isoformat(),
     }
 
-    # Generar métricas de rutas por escenario (sin particionado por día)
-    outputs_root = Path("src") / "outputs"
-    out_dir = outputs_root / scenario_id
-    out_dir.mkdir(parents=True, exist_ok=True)
+    routes_output_dir = Path("src") / "outputs" / "routes"
+    routes_output_dir.mkdir(parents=True, exist_ok=True)
+    master_csv_path = routes_output_dir / "route_candidates.csv"
 
     route_metrics_rows = []
 
-    # Si tenemos líneas procesadas, generar candidatos y calcular métricas por segmento
     if gdf_lines is not None and not gdf_lines.empty:
         gdf_proj = gdf_lines.to_crs(epsg=3857)
         for idx, row in gdf_lines.iterrows():
@@ -491,85 +509,82 @@ def compute_and_save_metrics(
             coords_proj = list(geom_proj.coords)
             if len(coords_proj) < 2:
                 continue
-            # cumulative distances using projected coords
             cum = [0.0]
             for i in range(1, len(coords_proj)):
-                a = coords_proj[i-1]
+                a = coords_proj[i - 1]
                 b = coords_proj[i]
-                dist = float(np.hypot(b[0]-a[0], b[1]-a[1]))
-                cum.append(cum[-1] + dist)
+                cum.append(cum[-1] + float(np.hypot(b[0] - a[0], b[1] - a[1])))
             n = len(coords_proj)
-            # generar subtramos i<j
-            for i in range(n-1):
-                for j in range(i+1, n):
+            for i in range(n - 1):
+                for j in range(i + 1, n):
                     path_len = cum[j] - cum[i]
                     if path_len <= 0:
                         continue
-                    chord = float(np.hypot(coords_proj[j][0]-coords_proj[i][0], coords_proj[j][1]-coords_proj[i][1]))
-                    # convertir a km
+                    chord = float(np.hypot(
+                        coords_proj[j][0] - coords_proj[i][0],
+                        coords_proj[j][1] - coords_proj[i][1],
+                    ))
                     length_real_km = path_len / 1000.0
                     length_straight_km = chord / 1000.0 if chord > 0 else 0.0
-                    straightness_index = length_real_km / length_straight_km if length_straight_km > 0 else None
-                    # si target_km proporcionado, filtrar por tolerancia
-                    accept_by_length = True
-                    abs_error_km = None
-                    relative_error = None
-                    accept_within_tol = None
-                    if target_km is not None and tolerance is not None:
-                        abs_error_km = abs(length_real_km - float(target_km))
-                        relative_error = abs_error_km / float(target_km) if float(target_km) != 0 else None
-                        accept_within_tol = (relative_error is not None and relative_error <= float(tolerance))
-                        accept_by_length = accept_within_tol
+                    straightness_index = (
+                        length_straight_km / length_real_km if length_real_km > 0 else None
+                    )
+                    straightness_c = chord / path_len if path_len > 0 else 0.0
 
-                    straightness_c = (chord / path_len) if path_len > 0 else 0.0
-                    score = straightness_c - (float(curve_penalty) * (abs(length_real_km - float(target_km)) / (float(target_km) + 1e-9))) if target_km is not None and curve_penalty is not None else straightness_c
-                    
-                    seg_geom = LineString(coords_lonlat[i:j+1])
+                    tol_prox = _nearest_km_bin(length_real_km, _bins)
+                    km_offset = length_real_km - tol_prox
+                    score = straightness_c - base_curve_penalty * abs(km_offset) / (tol_prox + 1e-9)
+                    accepted_by_tolerance = abs(km_offset) / (tol_prox + 1e-9) <= base_km_tolerance_ratio
+
+                    seg_geom = LineString(coords_lonlat[i: j + 1])
                     route_metrics_rows.append({
+                        "scenario_id": scenario_id,
                         "line": row.get("Line", ""),
-                        "line_idx": idx,
                         "start_idx": i,
                         "end_idx": j,
                         "length_real_km": length_real_km,
                         "length_straight_km": length_straight_km,
                         "straightness_index": straightness_index,
-                        "abs_error_km": abs_error_km,
-                        "relative_error": relative_error,
-                        "acceptance_within_tolerance": bool(accept_within_tol) if accept_within_tol is not None else None,
-                        "score": float(score) if score is not None else None,
+                        "tol_prox": tol_prox,
+                        "km_offset": km_offset,
+                        "accepted_by_tolerance": bool(accepted_by_tolerance),
+                        "score": float(score),
                         "geometry_wkt": seg_geom.wkt,
                     })
 
-    df_route_metrics = pd.DataFrame(route_metrics_rows)
-    # Si se especificó target_km y tolerance, filtrar filas aceptadas
-    if not df_route_metrics.empty and target_km is not None and tolerance is not None:
-        df_route_metrics["accepted"] = df_route_metrics["acceptance_within_tolerance"].fillna(False)
+    df_new = pd.DataFrame(route_metrics_rows)
+
+    if not df_new.empty:
+        df_new["rank_global"] = df_new["score"].rank(method="min", ascending=False)
+        df_new["rank_within_scenario"] = (
+            df_new.groupby("scenario_id")["score"].rank(method="min", ascending=False)
+        )
+
+    # Consolidar con CSV maestro existente
+    if master_csv_path.exists():
+        try:
+            df_existing = pd.read_csv(master_csv_path)
+            if "scenario_id" in df_existing.columns:
+                df_existing = df_existing[df_existing["scenario_id"] != scenario_id]
+            df_master = pd.concat([df_existing, df_new], ignore_index=True)
+            if "score" in df_master.columns:
+                df_master["rank_global"] = df_master["score"].rank(method="min", ascending=False)
+        except Exception:
+            df_master = df_new
     else:
-        df_route_metrics["accepted"] = False
+        df_master = df_new
 
-    # ordenar y rankear por cercanía al objetivo si existe
-    if not df_route_metrics.empty and "abs_error_km" in df_route_metrics.columns:
-        df_route_metrics["rank_abs_error"] = df_route_metrics["abs_error_km"].rank(method="min")
+    df_master.to_csv(master_csv_path, index=False)
+    logger.info(
+        f"[compute_and_save_metrics] route_candidates.csv actualizado: "
+        f"{len(df_master)} filas totales ({len(df_new)} nuevas para '{scenario_id}')"
+    )
 
-    # Guardar route_metrics_summary en outputs/<scenario_tag>
-    route_metrics_path = out_dir / f"route.csv"
-    df_route_metrics.to_csv(route_metrics_path, index=False)
-
-    # Actualizar índice general de escenarios
-    scenario_record = {
-        "scenario_id": scenario_id,
-        "target_km": target_km,
-        "curve_penalty": curve_penalty,
-        "tolerance": tolerance,
-        "num_candidates": len(df_route_metrics),
-        "num_accepted": int(df_route_metrics["accepted"].sum()) if not df_route_metrics.empty else 0,
-        "route_metrics_path": str(route_metrics_path),
-    }
-
+    num_accepted = int(df_new["accepted_by_tolerance"].fillna(False).sum()) if not df_new.empty else 0
     metrics.update({
-        "route_metrics_path": str(route_metrics_path),
-        "route_count_by_scenario": int(scenario_record["num_candidates"]),
-        "accepted_count": int(scenario_record["num_accepted"]),
+        "route_candidates_path": str(master_csv_path),
+        "route_count_by_scenario": len(df_new),
+        "accepted_count": num_accepted,
     })
 
     return metrics
@@ -580,10 +595,7 @@ def general_pipeline(
     path: str,
     stop_times_path: Optional[str] = None,
     trips_path: Optional[str] = None,
-    scenario_id: str = "default",
-    target_km: Optional[float] = None,
-    curve_penalty: Optional[float] = None,
-    tolerance: Optional[float] = None,
+    scenario_id: str = "base",
     cleaning_thresholds: Optional[Dict[str, Any]] = None,
 ):
     """Carga CSV de estaciones (GTFS-like) y construye GeoDataFrames y grafo.
@@ -593,12 +605,14 @@ def general_pipeline(
             'GTFS Stop ID', 'GTFS Latitude', 'GTFS Longitude'. Opcionalmente
             'Line', 'Complex ID', 'Daytime Routes', 'Borough', 'CBD'.
     """
- 
-    print(f"[gen_pipeline] Starting load for {path}")
+    pipeline_start = time.time()
 
-    # Preparar directorios procesados
+    # Preparar directorios procesados y activar log a archivo
     processed_root = Path("src") / "data" / "processed"
     dirs = ensure_processed_dirs(processed_root)
+    log_file = dirs["metrics"] / "preprocessing.log"
+    get_logger("data_cleaning", log_file=str(log_file))
+    logger.info(f"[gen_pipeline] Starting pipeline for {path} | scenario_id={scenario_id}")
 
     # 0) etapa de limpieza de estaciones (produce cleaned_stations.csv)
     cleaned_dir = dirs["cleaned"]
@@ -609,21 +623,23 @@ def general_pipeline(
     cleaned_trips_path = cleaned_dir / "cleaned_trip_times.csv"
 
     reports = []
+    stations_report: Dict[str, Any] = {}
+    stop_report: Dict[str, Any] = {}
 
     # Si ya existen los CSV limpios, evitar re-ejecución de limpieza
     if cleaned_stations_path.exists():
         stations_csv_path = str(cleaned_stations_path)
         stations_report = {"file": cleaned_stations_path.name, "note": "skipped_cleaning_exists", "out_path": str(cleaned_stations_path)}
-        print(f"[gen_pipeline] Found existing cleaned stations at {cleaned_stations_path}; skipping cleaning")
+        logger.info(f"[gen_pipeline] Found existing cleaned stations at {cleaned_stations_path}; skipping cleaning")
         reports.append(stations_report)
     else:
         try:
             cleaned_stations_path, stations_report = clean_stations(Path(path), processed_root, thresholds=cleaning_thresholds)
             stations_csv_path = str(cleaned_stations_path)
-            print(f"[gen_pipeline] Cleaned stations written to {cleaned_stations_path}")
+            logger.info(f"[gen_pipeline] Cleaned stations written to {cleaned_stations_path}")
             reports.append(stations_report)
         except Exception as e:
-            print(f"[gen_pipeline] Warning: failed cleaning stations: {e}; falling back to raw file")
+            logger.warning(f"[gen_pipeline] Warning: failed cleaning stations: {e}; falling back to raw file")
             stations_report = {"file": Path(path).name, "original_rows": None}
             stations_csv_path = path
             reports.append(stations_report)
@@ -752,26 +768,26 @@ def general_pipeline(
             try:
                 cleaned_trips_path, trips_report, trips_map = clean_trips(Path(trips_path), processed_root)
                 reports.append(trips_report)
-                print(f"[gen_pipeline] Cleaned trips written to {cleaned_trips_path}")
+                logger.info(f"[gen_pipeline] Cleaned trips written to {cleaned_trips_path}")
             except Exception as e:
-                print(f"[gen_pipeline] Warning: failed cleaning trips: {e}; using raw file")
+                logger.warning(f"[gen_pipeline] Warning: failed cleaning trips: {e}; using raw file")
 
     # Luego stop_times: preferir archivo limpio existente si está presente
     if cleaned_stop_times_path.exists():
         stop_times_to_process = str(cleaned_stop_times_path)
         stop_report = {"file": cleaned_stop_times_path.name, "note": "skipped_cleaning_exists", "out_path": str(cleaned_stop_times_path)}
         reports.append(stop_report)
-        print(f"[gen_pipeline] Found existing cleaned stop_times at {cleaned_stop_times_path}; skipping cleaning")
+        logger.info(f"[gen_pipeline] Found existing cleaned stop_times at {cleaned_stop_times_path}; skipping cleaning")
     else:
         if stop_times_path and os.path.exists(stop_times_path):
             try:
                 station_ids = set(gdf_nodes["GTFS Stop ID"].astype(str).values)
                 cleaned_stop_times_path, stop_report = clean_stop_times(Path(stop_times_path), processed_root, station_ids, thresholds=cleaning_thresholds, trips_map=trips_map if trips_map else None)
                 reports.append(stop_report)
-                print(f"[gen_pipeline] Cleaned stop_times written to {cleaned_stop_times_path}")
+                logger.info(f"[gen_pipeline] Cleaned stop_times written to {cleaned_stop_times_path}")
                 stop_times_to_process = str(cleaned_stop_times_path)
             except Exception as e:
-                print(f"[gen_pipeline] Warning: failed cleaning stop_times: {e}; using raw file")
+                logger.warning(f"[gen_pipeline] Warning: failed cleaning stop_times: {e}; using raw file")
                 stop_times_to_process = stop_times_path
         else:
             stop_times_to_process = stop_times_path
@@ -781,17 +797,15 @@ def general_pipeline(
 
     metadata = {"num_nodes": G.number_of_nodes(), "num_edges": G.number_of_edges()}
 
-    print(f"[gen_pipeline] Finished. Nodes: {metadata['num_nodes']}, Edges: {metadata['num_edges']}")
+    logger.info(f"[gen_pipeline] Finished. Nodes: {metadata['num_nodes']}, Edges: {metadata['num_edges']}")
 
-    # guardar procesado en carpeta 'processed' junto al raw
     # Guardar grafo procesado en la subcarpeta 'graph' dentro de processed
     graph_dir = dirs["graph"]
     try:
         save_processed_graph(G, gdf_nodes, gdf_lines, str(graph_dir))
-        print(f"[gen_pipeline] Saved processed CSVs to {graph_dir}")
+        logger.info(f"[gen_pipeline] Saved processed CSVs to {graph_dir}")
     except Exception as e:
-        print(f"[gen_pipeline] Warning: failed saving processed files: {e}")
-    # Graph CSVs are saved only in the `graph/` subdirectory to avoid duplication
+        logger.warning(f"[gen_pipeline] Warning: failed saving processed files: {e}")
 
     # Guardar manifest y reporte de calidad (aggregado)
     try:
@@ -806,7 +820,7 @@ def general_pipeline(
         write_manifest(manifest, dirs["manifests"])
         write_quality_report({r.get("file"): r for r in reports}, dirs["metrics"])
     except Exception as e:
-        print(f"[gen_pipeline] Warning: failed writing manifest/quality report: {e}")
+        logger.warning(f"[gen_pipeline] Warning: failed writing manifest/quality report: {e}")
 
     # Calcular métricas de preprocesado y resumen por ruta
     try:
@@ -814,10 +828,41 @@ def general_pipeline(
             G,
             gdf_lines,
             scenario_id=scenario_id,
-            target_km=target_km,
-            curve_penalty=curve_penalty,
-            tolerance=tolerance,
         )
-        print(f"[gen_pipeline] Computed preprocessing metrics: {metrics}")
+        logger.info(f"[gen_pipeline] Computed preprocessing metrics: {metrics}")
     except Exception as e:
-        print(f"[gen_pipeline] Warning: failed computing metrics: {e}")
+        logger.warning(f"[gen_pipeline] Warning: failed computing metrics: {e}")
+
+    # Guardar artefactos JSON individuales en metrics/
+    try:
+        metrics_dir = dirs["metrics"]
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+
+        # stations_cleaning_report.json
+        stations_report_path = metrics_dir / "stations_cleaning_report.json"
+        with open(stations_report_path, "w", encoding="utf-8") as fh:
+            json.dump(stations_report, fh, indent=2, ensure_ascii=False, default=str)
+
+        # stop_times_coverage.json
+        stop_coverage_path = metrics_dir / "stop_times_coverage.json"
+        with open(stop_coverage_path, "w", encoding="utf-8") as fh:
+            json.dump(stop_report, fh, indent=2, ensure_ascii=False, default=str)
+
+        # graph_summary.json
+        graph_summary = {
+            "scenario_id": scenario_id,
+            "num_nodes": int(G.number_of_nodes()),
+            "num_edges": int(G.number_of_edges()),
+            "km_bins": _KM_BINS_DEFAULT,
+            "processing_date": pd.Timestamp.now().isoformat(),
+        }
+        graph_summary_path = metrics_dir / "graph_summary.json"
+        with open(graph_summary_path, "w", encoding="utf-8") as fh:
+            json.dump(graph_summary, fh, indent=2, ensure_ascii=False, default=str)
+
+        logger.info(f"[gen_pipeline] Saved JSON reports to {metrics_dir}")
+    except Exception as e:
+        logger.warning(f"[gen_pipeline] Warning: failed saving JSON reports: {e}")
+
+    elapsed = time.time() - pipeline_start
+    logger.info(f"[gen_pipeline] Pipeline completed in {elapsed:.1f}s")

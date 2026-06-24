@@ -27,14 +27,10 @@ from shapely.geometry import Point, LineString
 from datetime import datetime
 import logging
 
-# configurar logger simple para información durante el preprocesado
-logger = logging.getLogger("data_cleaning")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("[cleaning] %(levelname)s: %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+from src.utils.others import get_logger
+
+# Logger del módulo — se puede añadir FileHandler vía get_logger(..., log_file=...)
+logger = get_logger("data_cleaning")
 
 
 def ensure_processed_dirs(processed_root: Path) -> Dict[str, Path]:
@@ -130,6 +126,9 @@ def clean_stations(raw_path: Path, processed_root: Path, thresholds: Optional[Di
     - Elimina filas con coordenadas inválidas (fuera de rango) o no convertibles.
     - Imputa columnas no críticas (ej. 'CBD' -> False si falta).
 
+    Si el CSV limpio ya existe en disco, se omite la limpieza y se regenera
+    únicamente el reporte de calidad a partir del archivo existente.
+
     Retorna la ruta al CSV limpio y un reporte de calidad (diccionario).
 
     Notas: conservar geometría en EPSG:4326 y añadir columnas proyectadas
@@ -138,6 +137,24 @@ def clean_stations(raw_path: Path, processed_root: Path, thresholds: Optional[Di
     raw_path = Path(raw_path)
     processed_root = Path(processed_root)
     dirs = ensure_processed_dirs(processed_root)
+
+    # Si el CSV limpio ya existe, regenerar solo el reporte de calidad desde él
+    out_path_check = dirs["cleaned"] / "cleaned_stations.csv"
+    if out_path_check.exists():
+        logger.info(f"[clean_stations] CSV limpio ya existe en {out_path_check}; regenerando reporte desde archivo existente")
+        existing_df = pd.read_csv(out_path_check)
+        report: Dict[str, Any] = {
+            "file": raw_path.name,
+            "note": "skipped_cleaning_exists",
+            "original_rows": len(existing_df),
+            "kept_rows": len(existing_df),
+            "dropped_rows": 0,
+            "out_path": str(out_path_check),
+            "columns": list(existing_df.columns),
+            "coverage_pct": 1.0,
+            "crs": "EPSG:4326",
+        }
+        return out_path_check, report
 
     df = pd.read_csv(raw_path, dtype=str)
     report: Dict[str, Any] = {"file": raw_path.name, "original_rows": len(df)}
@@ -267,11 +284,37 @@ def clean_stop_times(raw_path: Path, processed_root: Path, station_ids: Optional
     - Convierte tiempos heterogéneos (HH:MM:SS o segundos) a segundos numéricos.
     - Elimina duplicados exactos y reporta filas malformadas.
 
+    Si el CSV limpio ya existe en disco, se omite la limpieza y se regenera
+    únicamente el reporte de cobertura a partir del archivo existente.
+
     `station_ids` se usa para calcular la tasa de matching entre stop_id y estaciones.
     """
     raw_path = Path(raw_path)
     processed_root = Path(processed_root)
     dirs = ensure_processed_dirs(processed_root)
+
+    # Si el CSV limpio ya existe, regenerar solo el reporte de cobertura desde él
+    out_path_check = dirs["cleaned"] / "cleaned_stop_times.csv"
+    if out_path_check.exists():
+        logger.info(f"[clean_stop_times] CSV limpio ya existe en {out_path_check}; regenerando reporte desde archivo existente")
+        existing_st = pd.read_csv(out_path_check)
+        match_rate = None
+        if station_ids is not None and len(station_ids) > 0:
+            st_cols_existing = {c.lower(): c for c in existing_st.columns}
+            stop_col_existing = st_cols_existing.get("stop_id")
+            if stop_col_existing:
+                matched = existing_st[stop_col_existing].astype(str).isin(station_ids).sum()
+                match_rate = float(matched) / len(existing_st) if len(existing_st) > 0 else 0.0
+        report: Dict[str, Any] = {
+            "file": raw_path.name,
+            "note": "skipped_cleaning_exists",
+            "original_rows": len(existing_st),
+            "kept_rows": len(existing_st),
+            "dropped_rows": 0,
+            "stop_id_match_rate": match_rate,
+            "out_path": str(out_path_check),
+        }
+        return out_path_check, report
 
     st = pd.read_csv(raw_path, dtype=str)
     report: Dict[str, Any] = {"file": raw_path.name, "original_rows": len(st)}

@@ -5,7 +5,7 @@ Uso:
     python run.py --model gat --epochs 50
     python run.py --model gatv2 --epochs 50
     python run.py --model gat --hidden_dim 128 --num_layers 3
-    python run.py --test
+    python run.py --process-nyc
 """
 
 import argparse
@@ -18,9 +18,6 @@ from src.main_process.visualize import visualize_segments_csv, visualize_nodes_e
 from src.train.trainer import train_and_evaluate
 
 from src.config import Config
-
-def _sanitize(val: str) -> str:
-    return str(val).replace(".", "p").replace(",", "_").replace(" ", "_")
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -36,32 +33,29 @@ def parse_args():
         help="Modelo a entrenar",
     )
     parser.add_argument("--process-nyc", action="store_true", help="Procesar datos RAW de NYC y guardar en processed/")
-    parser.add_argument("--show-processed", action="store_true", help="Cargar y mostrar visualización desde src/data/processed/graph sin parámetros")
+    parser.add_argument("-s", "--show-processed", action="store_true", help="Cargar y mostrar visualización desde src/data/processed/graph sin parámetros")
     parser.add_argument("--cleaning-config", type=str, default=None, help="Ruta a JSON con umbrales/configuración de limpieza")
     parser.add_argument("--clean-outputs", action="store_true", help="Eliminar la carpeta src/outputs (limpieza de artefactos) antes de ejecutar")
-    
-    parser.add_argument("-v", "--view-file", nargs="?", const=True, default=None, help="Ruta a un CSV precomputado para visualizar. Si se llama sin argumento, usa -k/-t/-p para localizar el CSV.")
-    
-    parser.add_argument("-k", "--target", type=float, default=10.0, help="Longitud objetivo en km (solo un valor)")
-    parser.add_argument("-p", "--curve-penalty", type=float, default=0.5, help="Penalidad por curvas (mayor -> prefiere más rectitud)")
-    parser.add_argument("-t", "--tolerance", type=float, default=0.25, help="Tolerancia relativa para distancia objetivo (fracción)")
+    parser.add_argument("-r", "--route-analysis", action="store_true", help="Ejecutar análisis de rutas (estadísticas, distribución, rutas rectas)")
+
+    parser.add_argument("-v", "--view-file", action="store_true", default=False, help="Visualizar top-k segmentos del CSV maestro de rutas")
     parser.add_argument("-n", "--n-segments", type=int, default=None, help="Número de tramos del top a visualizar (solo para --view-file)")
     
-    # parser.add_argument("--hidden_dim", type=int, default=None, help="Dimensión oculta")
-    # parser.add_argument("--num_layers", type=int, default=None, help="Capas del encoder de grafos")
-    # parser.add_argument("--dropout", type=float, default=None, help="Dropout rate")
-    # parser.add_argument("--lr", type=float, default=None, help="Learning rate")
-    # parser.add_argument("--weight_decay", type=float, default=None, help="L2 regularization")
-    # parser.add_argument("--epochs", type=int, default=None, help="Número de épocas")
-    # parser.add_argument("--seed", type=int, default=None, help="Semilla aleatoria")
-    # parser.add_argument("--num_time_steps", type=int, default=None, help="Pasos temporales (GRU)")
-    # parser.add_argument(
-    #     "--device",
-    #     type=str,
-    #     default=None,
-    #     choices=["cpu", "cuda"],
-    #     help="Dispositivo de cómputo",
-    # )
+    parser.add_argument("--hidden_dim", type=int, default=None, help="Dimensión oculta")
+    parser.add_argument("--num_layers", type=int, default=None, help="Capas del encoder de grafos")
+    parser.add_argument("--dropout", type=float, default=None, help="Dropout rate")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=None, help="L2 regularization")
+    parser.add_argument("--epochs", type=int, default=None, help="Número de épocas")
+    parser.add_argument("--seed", type=int, default=None, help="Semilla aleatoria")
+    parser.add_argument("--num_time_steps", type=int, default=None, help="Pasos temporales (GRU)")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        choices=["cpu", "cuda"],
+        help="Dispositivo de cómputo",
+    )
 
     return parser.parse_args()
 
@@ -87,7 +81,7 @@ def main():
         if not (args.process_nyc or args.view_file or args.show_processed):
             train_and_evaluate(config)
 
-    # Si se solicita procesar los datos raw de NYC, ejecutar el pipeline y opcionalmente análisis de rutas
+    # Si se solicita procesar los datos raw de NYC, ejecutar el pipeline
     if args.process_nyc:
         base = os.path.join("src", "data")
         base_raw = os.path.join(base, "rawNYC")
@@ -118,56 +112,38 @@ def main():
             else:
                 print(f"[run.py] No outputs directory to remove at {out_root}")
 
-        km_label = str(int(float(args.target))) if float(args.target).is_integer() else _sanitize(str(args.target))
-        scenario_tag =f"target_{km_label}km_pen{_sanitize(str(args.curve_penalty))}_tol{_sanitize(str(args.tolerance))}"
-
-        # Ejecutar pipeline parametrizado (scenario_tag se usa como scenario_id internamente)
         general_pipeline(
             stations,
             stop_times_path=stop_times,
             trips_path=trips,
-            scenario_id=scenario_tag,
-            target_km=args.target,
-            curve_penalty=args.curve_penalty,
-            tolerance=args.tolerance,
+            scenario_id="base",
             cleaning_thresholds=cleaning_thresholds,
         )
 
         return 0
 
     # Visualizar si se pidió
-    if args.view_file is True:
-        km_label = str(int(float(args.target))) if float(args.target).is_integer() else _sanitize(str(args.target))
-        scenario_tag =f"target_{km_label}km_pen{_sanitize(str(args.curve_penalty))}_tol{_sanitize(str(args.tolerance))}"
-
-        print("[run.py] Loading processed CSVs for visualization...")
-        # Prefer visualizing top-k segments from the generated route.csv if available
-        out_dir = os.path.join("src", "outputs", scenario_tag)
-        route_csv_path = os.path.join(out_dir, "route.csv")
-        if os.path.exists(route_csv_path):
+    if args.view_file:
+        master_csv = os.path.join("src", "outputs", "routes", "route_candidates.csv")
+        print("[run.py] Loading master route CSV for visualization...")
+        if os.path.exists(master_csv):
             try:
-                # Export top-k using the exporter and visualize those segments
                 from src.routes.export_top_segments import export_top_k_from_route_csv
-                print(f"[run.py] Found route.csv at {route_csv_path}; exporting top segments...")
                 k = int(args.n_segments) if args.n_segments is not None else 50
-                exported = export_top_k_from_route_csv(route_csv_path, k=k)
+                print(f"[run.py] Exporting top-{k} segments from {master_csv}...")
+                exported = export_top_k_from_route_csv(master_csv, k=k)
                 print(f"[run.py] Visualizing exported top-{k} segments: {exported}")
-                visualize_segments_csv(exported, processed_dir=scenario_tag, show_nodes=True, figsize=(10,10))
+                visualize_segments_csv(exported, show_nodes=True, figsize=(10, 10))
             except Exception as e:
                 print(f"[run.py] Warning: failed exporting/visualizing top segments: {e}")
+                processed_dir = os.path.join("src", "data", "processed", "graph")
                 try:
                     gdf_nodes, gdf_lines = load_processed_gdfs(processed_dir)
                     visualize_nodes_edges(gdf_nodes, gdf_lines, show_labels=False, node_size=5)
                 except Exception as e2:
                     print(f"[run.py] Failed fallback visualization: {e2}")
         else:
-            # fallback: visualize processed graph (lines + nodes)
-            try:
-                gdf_nodes, gdf_lines = load_processed_gdfs(processed_dir)
-                print("[run.py] Visualizing processed data (loaded from CSV)...")
-                visualize_nodes_edges(gdf_nodes, gdf_lines, show_labels=False, node_size=5)
-            except Exception as e:
-                print(f"[run.py] Failed to visualize processed graph: {e}")
+            print(f"[run.py] Master CSV not found at {master_csv}; run --process-nyc first")
 
         return 0
 
@@ -181,6 +157,19 @@ def main():
             print(f"[run.py] Failed to visualize processed graph: {e}")
             return 1
         return 0
+    
+    # Ejecutar análisis de rutas si se pide
+    if args.route_analysis:
+        from src.routes.route_analysis import run_route_analysis
+        print("[run.py] Running route analysis...")
+        try:
+            result = run_route_analysis()
+            print("Artefactos generados:")
+            for key, path in result.items():
+                print(f"  {key}: {path}")()
+        except Exception as e:
+            print(f"[run.py] Failed to run route analysis: {e}")
+            return 1
 
     return 0
 

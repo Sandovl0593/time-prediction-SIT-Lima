@@ -27,7 +27,6 @@ from src.models.graphsage_model import TravelTimeGraphSAGE
 from src.utils.metrics import compute_all_metrics, travel_time_stats
 from src.utils.others import get_logger, set_seed
 
-
 logger = get_logger("trainer")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -384,7 +383,7 @@ def _load_processed_graph_as_pyg(
     labeled_train, labeled_val, labeled_test = _build_masks(
         num_items=len(labeled_idx),
         test_ratio=config.test_ratio,
-        val_ratio=0.1,
+        val_ratio=config.val_ratio,
         seed=config.seed,
     )
 
@@ -514,8 +513,13 @@ def evaluate_model(
     return metrics, preds
 
 
-def fit_model(model: nn.Module, data: Data, config: Config) -> Dict[str, object]:
-    """Entrena el modelo y conserva el mejor checkpoint según validación."""
+def fit_model(model: nn.Module, data: Data, config: Config, run_dir: Optional[Path] = None) -> Dict[str, object]:
+    """Entrena el modelo y conserva el mejor checkpoint según validación.
+
+    Args:
+        run_dir: Si se indica, guarda `best_model.pt` en esa carpeta cada vez
+            que se encuentra un nuevo mejor modelo.
+    """
     
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -526,20 +530,29 @@ def fit_model(model: nn.Module, data: Data, config: Config) -> Dict[str, object]
     best_val = float("inf")
     best_state = None
     patience_counter = 0
-    history = {
+    history: Dict[str, list] = {
+        "epoch": [],
         "train_loss": [],
-        "val_mse": []
+        "val_mse": [],
+        "val_mae": [],
+        "val_rmse": [],
+        "val_r2": [],
     }
     for epoch in range(1, config.epochs + 1):
         train_loss = train_epoch(model, data, optimizer, criterion)
-        history["train_loss"].append(train_loss)
         if epoch % config.eval_every == 0:
             val_metrics, _ = evaluate_model(
                 model, data,
                 mask_name="val"
             )
             val_mse = val_metrics["mse"]
+
+            history["epoch"].append(epoch)
+            history["train_loss"].append(train_loss)
             history["val_mse"].append(val_mse)
+            history["val_mae"].append(val_metrics["mae"])
+            history["val_rmse"].append(val_metrics["rmse"])
+            history["val_r2"].append(val_metrics["r2"])
 
             logger.info(
                 f"Epoch {epoch:4d}/{config.epochs} | "
@@ -550,12 +563,18 @@ def fit_model(model: nn.Module, data: Data, config: Config) -> Dict[str, object]
             )
             if val_mse < best_val:
                 best_val = val_mse
-                best_state = deepcopy( model.state_dict())
+                best_state = deepcopy(model.state_dict())
                 patience_counter = 0
                 logger.info(
                     f"   ✓ Nuevo mejor modelo "
                     f"(val_mse={best_val:.4f})"
                 )
+                if run_dir is not None:
+                    try:
+                        import torch as _torch
+                        _torch.save(best_state, run_dir / "best_model.pt")
+                    except Exception as _e:
+                        logger.warning(f"No se pudo guardar best_model.pt: {_e}")
             else:
                 patience_counter += 1
                 logger.info(
@@ -577,66 +596,119 @@ def train_and_evaluate(
     config: Config,
     processed_dir: Optional[Path] = None,
 ) -> Dict[str, object]:
-    """Pipeline completo: carga datos, entrena y evalúa en test."""
+    """Pipeline completo: carga datos, entrena, evalúa en test y guarda artefactos.
+
+    Crea una carpeta de corrida en:
+        src/outputs/training/<model>/<YYYYMMDD_HHMMSS>/
+    y guarda dentro:
+        training.log, history.csv, final_metrics.json,
+        test_predictions.csv, best_model.pt
+    """
+    import datetime
+
     set_seed(config.seed)
     device = torch.device(config.device)
 
+    # Crear carpeta de corrida
+    run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = (
+        PROJECT_ROOT / "src" / "outputs" / "training" / config.model / run_timestamp
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Activar log a archivo para esta corrida
+    run_logger = get_logger("trainer", log_file=str(run_dir / "training.log"))
+
     processed_dir = Path(processed_dir) if processed_dir is not None else DEFAULT_PROCESSED_GRAPH_DIR
-    logger.info(f"Cargando grafo procesado desde: {processed_dir}")
+    run_logger.info(f"Cargando grafo procesado desde: {processed_dir}")
 
     data, metadata = _load_processed_graph_as_pyg(processed_dir, config)
     data = data.to(device)
 
-    logger.info(
+    run_logger.info(
         f"Grafo cargado | nodos: {metadata['num_nodes']} | aristas: {metadata['num_edges']} | "
         f"etiquetadas: {metadata['num_labeled_edges']} | train/val/test: "
         f"{metadata['num_train_edges']}/{metadata['num_val_edges']}/{metadata['num_test_edges']}"
     )
-    logger.info(
+    run_logger.info(
         f"Features | node_dim: {metadata['node_feature_dim']} | edge_attr_dim: {metadata['edge_attr_dim']} | "
         f"target: {metadata['target_col']}"
     )
 
     model = build_model(config, data.x.shape[1], data.edge_attr.shape[1]).to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Modelo: {config.model} | Parámetros entrenables: {num_params:,}")
+    run_logger.info(f"Modelo: {config.model} | Parámetros entrenables: {num_params:,}")
 
-    logger.info(f"Entrenando durante {config.epochs} épocas...")
+    run_logger.info(f"Entrenando durante {config.epochs} épocas...")
     start_time = time.time()
-    train_info = fit_model(model, data, config)
+    train_info = fit_model(model, data, config, run_dir=run_dir)
     elapsed = time.time() - start_time
-    logger.info(f"Entrenamiento completado en {elapsed:.1f}s")
+    run_logger.info(f"Entrenamiento completado en {elapsed:.1f}s")
 
     final_metrics, preds = evaluate_model(model, data, mask_name="test")
     test_preds = preds[data.test_mask].detach().cpu().numpy()
     test_targets = data.y[data.test_mask].detach().cpu().numpy()
     stats = travel_time_stats(test_preds, test_targets)
 
-    logger.info("=" * 60)
-    logger.info(f"RESULTADOS FINALES — Modelo: {config.model.upper()}")
-    logger.info("=" * 60)
-    logger.info(f"MSE:  {final_metrics['mse']:.4f}")
-    logger.info(f"RMSE: {final_metrics['rmse']:.4f}")
-    logger.info(f"MAE:  {final_metrics['mae']:.4f}")
-    logger.info(f"MAPE: {final_metrics['mape']:.2f}%")
-    logger.info(f"R²:   {final_metrics['r2']:.4f}")
-    logger.info("-" * 60)
-    logger.info("Estadísticas de predicciones (test):")
-    logger.info(
+    run_logger.info("=" * 60)
+    run_logger.info(f"RESULTADOS FINALES — Modelo: {config.model.upper()}")
+    run_logger.info("=" * 60)
+    run_logger.info(f"MSE:  {final_metrics['mse']:.4f}")
+    run_logger.info(f"RMSE: {final_metrics['rmse']:.4f}")
+    run_logger.info(f"MAE:  {final_metrics['mae']:.4f}")
+    run_logger.info(f"MAPE: {final_metrics['mape']:.2f}%")
+    run_logger.info(f"R²:   {final_metrics['r2']:.4f}")
+    run_logger.info("-" * 60)
+    run_logger.info("Estadísticas de predicciones (test):")
+    run_logger.info(
         f"Media pred: {stats.get('pred_mean', 0.0):.2f} | Media target: {stats.get('target_mean', 0.0):.2f}"
     )
-    logger.info(
+    run_logger.info(
         f"Mediana pred: {stats.get('pred_median', 0.0):.2f} | Mediana target: {stats.get('target_median', 0.0):.2f}"
     )
-    logger.info(
+    run_logger.info(
         f"Std pred: {stats.get('pred_std', 0.0):.2f} | Std target: {stats.get('target_std', 0.0):.2f}"
     )
-    logger.info(f"P25 error: {stats.get('error_p25', 0.0):.2f} | P75 error: {stats.get('error_p75', 0.0):.2f}")
-    logger.info(f"P90 error: {stats.get('error_p90', 0.0):.2f}")
-    logger.info("=" * 60)
+    run_logger.info(f"P25 error: {stats.get('error_p25', 0.0):.2f} | P75 error: {stats.get('error_p75', 0.0):.2f}")
+    run_logger.info(f"P90 error: {stats.get('error_p90', 0.0):.2f}")
+    run_logger.info("=" * 60)
+
+    # --- Guardar artefactos de la corrida ---
+    try:
+        # history.csv
+        history_df = pd.DataFrame(train_info)
+        history_df.to_csv(run_dir / "history.csv", index=False)
+
+        # final_metrics.json
+        artifacts_metrics = {
+            **final_metrics,
+            "model": config.model,
+            "elapsed_seconds": elapsed,
+            "num_params": num_params,
+            "num_train_edges": int(metadata["num_train_edges"]),
+            "num_val_edges": int(metadata["num_val_edges"]),
+            "num_test_edges": int(metadata["num_test_edges"]),
+            "stats": stats,
+        }
+        import json as _json
+        with open(run_dir / "final_metrics.json", "w", encoding="utf-8") as fh:
+            _json.dump(artifacts_metrics, fh, indent=2, ensure_ascii=False, default=str)
+
+        # test_predictions.csv
+        test_edge_indices = data.test_mask.nonzero(as_tuple=False).squeeze(1).cpu().numpy()
+        pd.DataFrame({
+            "edge_idx": test_edge_indices,
+            "pred": test_preds,
+            "target": test_targets,
+        }).to_csv(run_dir / "test_predictions.csv", index=False)
+
+        run_logger.info(f"Artefactos guardados en {run_dir}")
+    except Exception as _e:
+        run_logger.warning(f"No se pudieron guardar algunos artefactos: {_e}")
 
     return {
         "model": config.model,
+        "run_dir": str(run_dir),
         "processed_dir": str(processed_dir),
         "metadata": metadata,
         "num_params": num_params,
