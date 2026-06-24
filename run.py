@@ -166,7 +166,7 @@ def main():
             result = run_route_analysis()
             print("Artefactos generados:")
             for key, path in result.items():
-                print(f"  {key}: {path}")()
+                print(f"  {key}: {path}")
         except Exception as e:
             print(f"[run.py] Failed to run route analysis: {e}")
             return 1
