@@ -28,7 +28,6 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-           default="gat",
         choices=Config.VALID_MODELS,
         help="Modelo a entrenar",
     )
@@ -38,7 +37,26 @@ def parse_args():
     parser.add_argument("--clean-outputs", action="store_true", help="Eliminar la carpeta src/outputs (limpieza de artefactos) antes de ejecutar")
     parser.add_argument("-r", "--route-analysis", action="store_true", help="Ejecutar análisis de rutas (estadísticas, distribución, rutas rectas)")
 
+    parser.add_argument(
+        "--eval-subsets",
+        nargs="*",
+        default=None,
+        metavar="SUBSET",
+        help=(
+            "Subconjuntos a evaluar tras el entrenamiento. "
+            "Opciones: config_A config_B config_C straight. "
+            "Sin valor: incluye todos los que tengan CSV disponible. "
+            "Ejemplo: --eval-subsets config_A config_B"
+        ),
+    )
+    parser.add_argument(
+        "--gen-report",
+        action="store_true",
+        help="Generar src/outputs/reports/tex_data.json a partir de los artefactos de entrenamiento existentes",
+    )
+
     parser.add_argument("-v", "--view-file", action="store_true", default=False, help="Visualizar top-k segmentos del CSV maestro de rutas")
+    parser.add_argument("-c", "--config", type=str, default="A", help="Ruta a CSV de configuración de top-k segmentos (por defecto config_A.csv)")
     parser.add_argument("-n", "--n-segments", type=int, default=None, help="Número de tramos del top a visualizar (solo para --view-file)")
     
     parser.add_argument("--hidden_dim", type=int, default=None, help="Dimensión oculta")
@@ -79,7 +97,40 @@ def main():
 
         # Process the model training and evaluation if not in a special mode
         if not (args.process_nyc or args.view_file or args.show_processed):
-            train_and_evaluate(config)
+            # Resolver subconjuntos de evaluación
+            _SUBSET_CSVS = {
+                "config_A": os.path.join("src", "topsegments", "config_A.csv"),
+                "config_B": os.path.join("src", "topsegments", "config_B.csv"),
+                "config_C": os.path.join("src", "topsegments", "config_C.csv"),
+                "straight": os.path.join("src", "outputs", "routes", "straight_routes.csv"),
+            }
+            if args.eval_subsets is None:
+                # Por defecto: incluir todos los subsets cuyos CSVs existan
+                eval_subsets = {
+                    name: path
+                    for name, path in _SUBSET_CSVS.items()
+                    if os.path.exists(path)
+                }
+            elif len(args.eval_subsets) == 0:
+                # --eval-subsets sin argumentos: mismo comportamiento que default
+                eval_subsets = {
+                    name: path
+                    for name, path in _SUBSET_CSVS.items()
+                    if os.path.exists(path)
+                }
+            else:
+                eval_subsets = {
+                    name: _SUBSET_CSVS[name]
+                    for name in args.eval_subsets
+                    if name in _SUBSET_CSVS
+                }
+                unknown = [s for s in args.eval_subsets if s not in _SUBSET_CSVS]
+                if unknown:
+                    print(f"[run.py] Warning: subsets desconocidos ignorados: {unknown}")
+
+            if eval_subsets:
+                print(f"[run.py] Subsets de evaluación: {list(eval_subsets.keys())}")
+            train_and_evaluate(config, eval_subsets=eval_subsets or None)
 
     # Si se solicita procesar los datos raw de NYC, ejecutar el pipeline
     if args.process_nyc:
@@ -124,18 +175,15 @@ def main():
 
     # Visualizar si se pidió
     if args.view_file:
-        master_csv = os.path.join("src", "outputs", "routes", "route_candidates.csv")
-        print("[run.py] Loading master route CSV for visualization...")
-        if os.path.exists(master_csv):
+        # Usar config_A.csv como vista por defecto (configuración más estricta)
+        set_config = args.config if args.config else "A"
+        config_csv = os.path.join("src", "topsegments", f"config_{set_config}.csv")
+        print("[run.py] Loading config_A segments for visualization...")
+        if os.path.exists(config_csv):
             try:
-                from src.routes.export_top_segments import export_top_k_from_route_csv
-                k = int(args.n_segments) if args.n_segments is not None else 50
-                print(f"[run.py] Exporting top-{k} segments from {master_csv}...")
-                exported = export_top_k_from_route_csv(master_csv, k=k)
-                print(f"[run.py] Visualizing exported top-{k} segments: {exported}")
-                visualize_segments_csv(exported, show_nodes=True, figsize=(10, 10))
+                visualize_segments_csv(config_csv, show_nodes=True, figsize=(10, 10))
             except Exception as e:
-                print(f"[run.py] Warning: failed exporting/visualizing top segments: {e}")
+                print(f"[run.py] Warning: failed visualizing config segments: {e}")
                 processed_dir = os.path.join("src", "data", "processed", "graph")
                 try:
                     gdf_nodes, gdf_lines = load_processed_gdfs(processed_dir)
@@ -143,7 +191,7 @@ def main():
                 except Exception as e2:
                     print(f"[run.py] Failed fallback visualization: {e2}")
         else:
-            print(f"[run.py] Master CSV not found at {master_csv}; run --process-nyc first")
+            print(f"[run.py] Config CSV not found at {config_csv}; run --route-analysis first")
 
         return 0
 
@@ -169,6 +217,17 @@ def main():
                 print(f"  {key}: {path}")
         except Exception as e:
             print(f"[run.py] Failed to run route analysis: {e}")
+            return 1
+
+    # Generar reporte tex_data.json si se pide
+    if args.gen_report:
+        from src.reports.report_builder import generate_tex_data_report
+        print("[run.py] Generando tex_data.json...")
+        try:
+            out_path = generate_tex_data_report()
+            print(f"[run.py] Reporte generado: {out_path}")
+        except Exception as e:
+            print(f"[run.py] Error al generar reporte: {e}")
             return 1
 
     return 0

@@ -2,7 +2,26 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import List
 
+KM_BINS_DEFAULT: List[float] = [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0]
+
+# Rangos de parámetros: (ideal/estricto, peor caso realista/permisivo)
+# curve_penalty  ideal=0.5 → penaliza fuertemente las curvas; mínimo realista=0.1
+# km_tolerance   ideal=0.2 → ±20% del bin; máximo realista=0.5 → ±50%
+CURVE_PENALTY_RANGE = (0.5, 0.1)
+KM_TOLERANCE_RANGE  = (0.2, 0.5)
+
+# ---------- Route configurations A/B/C ----------
+# Cada config define un par (km_tolerance, curve_penalty) dentro de los rangos.
+# A: estricta en km, alta penalidad → rutas rectas bien ajustadas al bin.
+# B: tolerancia media, penalidad media → balance entre cobertura y rectitud.
+# C: tolerancia amplia, baja penalidad → máxima cobertura de candidatos.
+ROUTE_CONFIGS = {
+    "A": {"km_tolerance": 0.2, "curve_penalty": 0.5},
+    "B": {"km_tolerance": 0.3, "curve_penalty": 0.3},
+    "C": {"km_tolerance": 0.4, "curve_penalty": 0.2},
+}
 
 @dataclass
 class Config:
@@ -32,16 +51,6 @@ class Config:
     graph_dir = data_dir / "graph"
     routes_output_dir = Path("src/outputs/routes")
     training_output_dir = Path("src/outputs/training")
-
-    # ---------- Bins km para distribución de rutas ----------
-    # KM_BINS: list = [1, 2, 5, 10, 15, 20]
-
-    # ---------- Route configurations A/B/C ----------
-    ROUTE_CONFIGS = {
-        "A": {"target_km": 5.0, "km_tolerance": 0.2, "curve_penalty": 0.5},
-        "B": {"target_km": 10.0, "km_tolerance": 0.3, "curve_penalty": 0.3},
-        "C": {"target_km": 15.0, "km_tolerance": 0.4, "curve_penalty": 0.2},
-    }
 
     # ---------- Model ----------
     model: str = "gatv2"      # graphsage | gat | gatv2

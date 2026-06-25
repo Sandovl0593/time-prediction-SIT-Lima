@@ -151,9 +151,15 @@ def run_route_analysis(
         - straight_routes.csv
         - straight_routes_by_config.json
 
+    Después genera los segmentos por configuración A/B/C en src/topsegments/:
+        - config_A.csv, config_B.csv, config_C.csv
+        - config_export_summary.json
+
     Returns:
         Diccionario con rutas de los artefactos generados.
     """
+    from src.routes.export_top_segments import export_segments_by_config
+
     out_dir = Path(output_dir) if output_dir is not None else _DEFAULT_OUTPUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -185,6 +191,16 @@ def run_route_analysis(
     with open(by_config_path, "w", encoding="utf-8") as fh:
         json.dump(by_config, fh, indent=2, ensure_ascii=False, default=str)
     artifacts["straight_routes_by_config"] = str(by_config_path)
+
+    # config_A/B/C.csv — segmentos filtrados por configuración
+    try:
+        config_artifacts = export_segments_by_config(
+            straight_csv=straight_path,
+            straightness_threshold=straightness_threshold,
+        )
+        artifacts.update(config_artifacts)
+    except Exception as e:
+        artifacts["config_export_error"] = str(e)
 
     return artifacts
 

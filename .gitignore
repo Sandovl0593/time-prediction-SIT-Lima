@@ -5,4 +5,4 @@ __pycache__/
 **/processed/*/*.json
 **/*.csv
 outputs/
-starter/
+topsegments/

@@ -418,8 +418,191 @@ def _load_processed_graph_as_pyg(
     # Detecta patrones repetidos útiles para debug
     duplicate_uv = int(edge_graph_df.duplicated(subset=["u", "v"], keep=False).sum())
     metadata["duplicate_uv_edges"] = duplicate_uv
+    # Non-serializable reference — used for subset evaluation; pop before JSON serialization
+    metadata["_edge_graph_df"] = edge_graph_df
 
     return data, metadata
+
+
+def _build_subset_mask(
+    edge_graph_df: pd.DataFrame,
+    nodes_path: Path,
+    filter_csv_path: Path,
+) -> Tuple[torch.Tensor, pd.DataFrame]:
+    """Construye máscara booleana para aristas que aparecen como segmentos directos en filter_csv.
+
+    Estrategia de matching:
+    1. Carga filter_csv y retiene solo rutas 1-hop (geometry_wkt de 2 puntos).
+    2. Carga nodes.csv para construir el dict {pos_idx: GTFS_Stop_ID}.
+    3. Convierte start_idx/end_idx → GTFS Stop IDs.
+    4. Cruza contra (u, v) en edge_graph_df.
+
+    Returns:
+        in_subset: bool tensor de shape [len(edge_graph_df)]
+        meta_df: DataFrame con metadata de ruta para las aristas matched
+                 (edge_pos_idx, u, v, straightness_index, tol_prox, km_offset, line, ...)
+    """
+    n = len(edge_graph_df)
+    empty_meta = pd.DataFrame()
+
+    try:
+        filter_df = pd.read_csv(str(filter_csv_path), low_memory=False)
+    except Exception as exc:
+        logger.warning("_build_subset_mask: no se pudo leer %s — %s", filter_csv_path, exc)
+        return torch.zeros(n, dtype=torch.bool), empty_meta
+
+    # Retener solo rutas 1-hop: geometry_wkt con exactamente 2 puntos coordenados
+    if "geometry_wkt" in filter_df.columns:
+        def _is_direct(wkt_str: str) -> bool:
+            if not isinstance(wkt_str, str) or not wkt_str.strip():
+                return False
+            try:
+                return len(list(wkt.loads(wkt_str).coords)) == 2
+            except Exception:
+                return False
+        filter_df = filter_df[filter_df["geometry_wkt"].apply(_is_direct)].copy()
+
+    if filter_df.empty:
+        logger.warning(
+            "_build_subset_mask: ninguna ruta directa (1-hop) encontrada en %s", filter_csv_path
+        )
+        return torch.zeros(n, dtype=torch.bool), empty_meta
+
+    # Construir mapeo pos_idx → GTFS Stop ID desde nodes.csv
+    try:
+        nodes_df = _safe_read_csv(nodes_path)
+        node_ids: list = nodes_df["GTFS Stop ID"].astype(str).tolist()
+    except Exception as exc:
+        logger.warning("_build_subset_mask: no se pudo leer nodes.csv — %s", exc)
+        return torch.zeros(n, dtype=torch.bool), empty_meta
+
+    def _idx_to_gtfs(idx) -> str:
+        """Convierte un índice posicional a GTFS Stop ID; si falla trata el valor como ID directo."""
+        try:
+            i = int(idx)
+            if 0 <= i < len(node_ids):
+                return node_ids[i]
+        except (ValueError, TypeError):
+            pass
+        return str(idx)  # fallback: tratarlo como GTFS ID directamente
+
+    filter_df["_u_str"] = filter_df["start_idx"].apply(_idx_to_gtfs)
+    filter_df["_v_str"] = filter_df["end_idx"].apply(_idx_to_gtfs)
+    filter_pairs: set = set(zip(filter_df["_u_str"], filter_df["_v_str"]))
+
+    # Construir lookup de metadata por (u, v) — primer match gana
+    meta_cols = ["_u_str", "_v_str"] + [
+        c for c in ("straightness_index", "tol_prox", "km_offset", "line", "score", "config_score")
+        if c in filter_df.columns
+    ]
+    meta_lookup: dict = {}
+    for _, row in filter_df[meta_cols].iterrows():
+        key = (row["_u_str"], row["_v_str"])
+        if key not in meta_lookup:
+            meta_lookup[key] = {k: v for k, v in row.items() if k not in ("_u_str", "_v_str")}
+
+    # Construir máscara y filas de metadata
+    in_subset_list: list = []
+    meta_rows: list = []
+    for pos_idx, row in edge_graph_df.iterrows():
+        u_str = str(row["u"])
+        v_str = str(row["v"])
+        key = (u_str, v_str)
+        in_subset_list.append(key in filter_pairs)
+        if key in filter_pairs:
+            meta = {"edge_pos_idx": pos_idx, "u": u_str, "v": v_str}
+            meta.update(meta_lookup.get(key, {}))
+            meta_rows.append(meta)
+
+    in_subset_tensor = torch.tensor(in_subset_list, dtype=torch.bool)
+    meta_df = pd.DataFrame(meta_rows) if meta_rows else empty_meta
+    return in_subset_tensor, meta_df
+
+
+def evaluate_on_subset(
+    model: nn.Module,
+    data: Data,
+    edge_graph_df: pd.DataFrame,
+    nodes_path: Path,
+    filter_csv_path: Path,
+    subset_name: str,
+    run_dir: Path,
+    device: torch.device,
+) -> Optional[Dict[str, object]]:
+    """Evalúa el modelo entrenado sobre test_mask ∩ labeled_mask ∩ in_subset.
+
+    Guarda:
+        run_dir/eval_{subset_name}/metrics.json
+        run_dir/eval_{subset_name}/predictions.csv
+
+    Returns:
+        Dict con las métricas, o None si no hay aristas de evaluación.
+    """
+    import json as _json
+
+    out_dir = run_dir / f"eval_{subset_name}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        in_subset, meta_df = _build_subset_mask(edge_graph_df, nodes_path, filter_csv_path)
+    except Exception as exc:
+        logger.warning("evaluate_on_subset [%s]: error al construir máscara — %s", subset_name, exc)
+        with open(out_dir / "metrics.json", "w", encoding="utf-8") as fh:
+            _json.dump({"subset_name": subset_name, "n_eval": 0, "skipped": True, "error": str(exc)}, fh, indent=2)
+        return None
+
+    in_subset = in_subset.to(device)
+    # labeled_mask: aristas con target no-NaN (re-verificación explícita)
+    labeled_mask = ~torch.isnan(data.y)
+    eval_mask = data.test_mask & labeled_mask & in_subset
+    n_eval = int(eval_mask.sum().item())
+
+    if n_eval == 0:
+        logger.warning(
+            "evaluate_on_subset [%s]: ninguna arista de test coincide con el subconjunto", subset_name
+        )
+        with open(out_dir / "metrics.json", "w", encoding="utf-8") as fh:
+            _json.dump({"subset_name": subset_name, "n_eval": 0, "skipped": True}, fh, indent=2)
+        return None
+
+    model.eval()
+    with torch.no_grad():
+        all_preds = model(data.x, data.edge_index, data.edge_attr).squeeze(-1)
+
+    subset_preds = all_preds[eval_mask].detach().cpu().numpy()
+    subset_targets = data.y[eval_mask].detach().cpu().numpy()
+
+    metrics = compute_all_metrics(subset_preds, subset_targets)
+    metrics_out: Dict[str, object] = {
+        "subset_name": subset_name,
+        "n_eval": n_eval,
+        **{k: float(v) for k, v in metrics.items()},
+    }
+    with open(out_dir / "metrics.json", "w", encoding="utf-8") as fh:
+        _json.dump(metrics_out, fh, indent=2, ensure_ascii=False)
+
+    # Predictions CSV — enriquecido con metadata de ruta
+    eval_edge_indices = eval_mask.nonzero(as_tuple=False).squeeze(1).cpu().numpy()
+    pred_df = pd.DataFrame({
+        "edge_idx": eval_edge_indices,
+        "pred": subset_preds,
+        "target": subset_targets,
+    })
+    if not meta_df.empty and "edge_pos_idx" in meta_df.columns:
+        pred_df = pred_df.merge(
+            meta_df.rename(columns={"edge_pos_idx": "edge_idx"}),
+            on="edge_idx",
+            how="left",
+        )
+    pred_df.to_csv(out_dir / "predictions.csv", index=False)
+
+    logger.info(
+        "Subset eval [%s] | n_eval: %d | RMSE: %.4f | R²: %.4f",
+        subset_name, n_eval,
+        metrics.get("rmse", float("nan")),
+        metrics.get("r2", float("nan")),
+    )
+    return metrics_out
 
 
 def build_model(config: Config, in_channels: int, edge_attr_dim: int) -> nn.Module:
@@ -595,6 +778,7 @@ def fit_model(model: nn.Module, data: Data, config: Config, run_dir: Optional[Pa
 def train_and_evaluate(
     config: Config,
     processed_dir: Optional[Path] = None,
+    eval_subsets: Optional[Dict[str, Path]] = None,
 ) -> Dict[str, object]:
     """Pipeline completo: carga datos, entrena, evalúa en test y guarda artefactos.
 
@@ -603,6 +787,11 @@ def train_and_evaluate(
     y guarda dentro:
         training.log, history.csv, final_metrics.json,
         test_predictions.csv, best_model.pt
+
+    Si se pasan eval_subsets ({nombre: Path_a_filter_csv}), tras el entrenamiento
+    evalúa el modelo sobre test_mask ∩ labeled_mask ∩ aristas_del_subconjunto y
+    guarda los artefactos en run_dir/eval_{nombre}/.
+    Solo se consideran aristas con travel_time_s (no-NaN) que estén en el test_mask.
     """
     import datetime
 
@@ -623,6 +812,9 @@ def train_and_evaluate(
     run_logger.info(f"Cargando grafo procesado desde: {processed_dir}")
 
     data, metadata = _load_processed_graph_as_pyg(processed_dir, config)
+    # Extraer edge_graph_df antes de pasar metadata a serialización
+    edge_graph_df: pd.DataFrame = metadata.pop("_edge_graph_df", pd.DataFrame())
+    nodes_path = processed_dir / "nodes.csv"
     data = data.to(device)
 
     run_logger.info(
@@ -705,6 +897,21 @@ def train_and_evaluate(
         run_logger.info(f"Artefactos guardados en {run_dir}")
     except Exception as _e:
         run_logger.warning(f"No se pudieron guardar algunos artefactos: {_e}")
+
+    # --- Evaluación sobre subconjuntos de aristas ---
+    if eval_subsets:
+        run_logger.info("Evaluando sobre %d subconjunto(s)...", len(eval_subsets))
+        for subset_name, filter_csv_path in eval_subsets.items():
+            filter_path = Path(filter_csv_path)
+            if not filter_path.exists():
+                run_logger.warning(
+                    "Subset '%s': CSV filtro no encontrado en %s — omitido", subset_name, filter_path
+                )
+                continue
+            evaluate_on_subset(
+                model, data, edge_graph_df, nodes_path,
+                filter_path, subset_name, run_dir, device,
+            )
 
     return {
         "model": config.model,

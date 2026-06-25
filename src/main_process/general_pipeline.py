@@ -22,6 +22,7 @@ from collections import defaultdict
 import logging
 
 from src.utils.others import get_logger
+from src.config import KM_BINS_DEFAULT
 
 logger = get_logger("data_cleaning")
 
@@ -454,9 +455,6 @@ def load_processed_gdfs(processed_dir: str) -> Tuple[gpd.GeoDataFrame, gpd.GeoDa
     return gdf_nodes, gdf_lines
 
 
-_KM_BINS_DEFAULT: List[float] = [1.0, 2.0, 5.0, 10.0, 15.0, 20.0]
-
-
 def _nearest_km_bin(km: float, bins: List[float]) -> float:
     """Devuelve el bin de km más cercano a `km` (tol_prox)."""
     return float(min(bins, key=lambda b: abs(km - b)))
@@ -484,7 +482,7 @@ def compute_and_save_metrics(
     Si el archivo maestro ya existe y contiene filas para este scenario_id,
     esas filas se eliminan antes de escribir las nuevas.
     """
-    _bins = _KM_BINS_DEFAULT
+    _bins = KM_BINS_DEFAULT
 
     metrics = {
         "num_nodes": int(G.number_of_nodes()) if G is not None else 0,
@@ -853,7 +851,7 @@ def general_pipeline(
             "scenario_id": scenario_id,
             "num_nodes": int(G.number_of_nodes()),
             "num_edges": int(G.number_of_edges()),
-            "km_bins": _KM_BINS_DEFAULT,
+            "km_bins": KM_BINS_DEFAULT,
             "processing_date": pd.Timestamp.now().isoformat(),
         }
         graph_summary_path = metrics_dir / "graph_summary.json"
