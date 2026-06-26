@@ -59,7 +59,7 @@ def _rustic_1d_projection(coords: np.ndarray) -> np.ndarray:
     return x if var_x >= var_y else y
 
 
-def _order_points_via_rustic_and_2opt(
+def _order_points_1d(
     coords: np.ndarray,
     max_iter: int = 3
 ) -> np.ndarray:
@@ -97,33 +97,33 @@ def _order_points_via_rustic_and_2opt(
     order = list(best)
 
     # Mejora local 2-opt (open path)
-    it = 0
-    improved = True
-    while improved and it < max_iter:
-        improved = False
-        it += 1
-        for i in range(0, n - 2):
-            for j in range(i + 1, n - 1):
-                # Consider edges (i,i+1) and (j,j+1)
-                a = coords[order[i]]
-                b = coords[order[i + 1]]
-                c = coords[order[j]]
-                d = coords[order[j + 1]]
-                cur = np.linalg.norm(a - b) + np.linalg.norm(c - d)
-                new = np.linalg.norm(a - c) + np.linalg.norm(b - d)
-                if new + 1e-9 < cur:
-                    # Revertir segmento (i+1 .. j) inclusive
-                    order[i + 1 : j + 1] = list(reversed(order[i + 1 : j + 1]))
-                    improved = True
-                    break
-            if improved:
-                break
+    # it = 0
+    # improved = True
+    # while improved and it < max_iter:
+    #     improved = False
+    #     it += 1
+    #     for i in range(0, n - 2):
+    #         for j in range(i + 1, n - 1):
+    #             # Consider edges (i,i+1) and (j,j+1)
+    #             a = coords[order[i]]
+    #             b = coords[order[i + 1]]
+    #             c = coords[order[j]]
+    #             d = coords[order[j + 1]]
+    #             cur = np.linalg.norm(a - b) + np.linalg.norm(c - d)
+    #             new = np.linalg.norm(a - c) + np.linalg.norm(b - d)
+    #             if new + 1e-9 < cur:
+    #                 # Revertir segmento (i+1 .. j) inclusive
+    #                 order[i + 1 : j + 1] = list(reversed(order[i + 1 : j + 1]))
+    #                 improved = True
+    #                 break
+    #         if improved:
+    #             break
 
     return np.array(order, dtype=int)
 
 
 # La implementación anterior basada en PCA fue eliminada; usar
-# _order_points_via_rustic_and_2opt junto con _rustic_1d_projection.
+# _order_points_1d junto con _rustic_1d_projection.
 
 def _load_nodes_from_csv(path: str) -> gpd.GeoDataFrame:
     print(f"[gen_pipeline] Reading stations CSV from {path}")
@@ -163,14 +163,18 @@ def _build_lines_from_nodes(gdf_nodes: gpd.GeoDataFrame):
 
         # Orden inicial rústico + refinamiento 2-opt para evitar zigzags
         try:
-            order = _order_points_via_rustic_and_2opt(coords, max_iter=3)
+            order = _order_points_1d(coords, max_iter=3)
             ordered = sub.iloc[order]
         except Exception:
             # Fallback simple si algo falla: ordenar por coordenada dominante
             proj = _rustic_1d_projection(coords)
             order = np.argsort(proj)
             ordered = sub.iloc[order]
-        line_orders.append((line_name, ordered))
+
+        # Lista ordenada de GTFS Stop IDs — usada en compute_and_save_metrics
+        # para emitir start_stop_id/end_stop_id en lugar de índices posicionales
+        stop_ids = list(ordered["GTFS Stop ID"].astype(str))
+        line_orders.append((line_name, ordered, stop_ids))
 
         # crear LineString en WGS84 (lon, lat)
         line_coords = list(zip(ordered["GTFS Longitude"].values, ordered["GTFS Latitude"].values))
@@ -193,8 +197,6 @@ def _build_graph_from_nodes_and_lines(gdf_nodes: gpd.GeoDataFrame, line_orders):
             "lat": float(row["GTFS Latitude"]) if pd.notna(row["GTFS Latitude"]) else None,
             "x": float(row["_x"]),
             "y": float(row["_y"]),
-            # 'Borough' and 'CBD' fueron descartados antes de la ingestión
-            # y por tanto no se incluyen como atributos de nodo.
             "line": row.get("Line"),
             "structure": row.get("Structure", "unknown"),
             "geometry": row.geometry,
@@ -203,7 +205,7 @@ def _build_graph_from_nodes_and_lines(gdf_nodes: gpd.GeoDataFrame, line_orders):
         node_meta[node_id] = attrs
 
     print("[gen_pipeline] Adding spatial edges between consecutive stations per line")
-    for line_name, ordered in line_orders:
+    for line_name, ordered, _stop_ids in line_orders:  # desempacar tupla de 3
         prev_id = None
         prev_row = None
         for _, row in ordered.iterrows():
@@ -466,22 +468,26 @@ def compute_and_save_metrics(
     scenario_id: str = "base",
     base_curve_penalty: float = IDEAL_CURVE_PENALTY,
     base_km_tolerance_ratio: float = IDEAL_KM_TOLERANCE,
+    line_orders: Optional[list] = None,
 ) -> Dict[str, Any]:
     """Computa métricas del grafo y escribe el CSV maestro de rutas candidatas.
 
-    Todos los escenarios acumulan sus filas en un único archivo maestro:
-        src/outputs/routes/route_candidates.csv
+    Solo genera aristas 1-hop (estación i → estación i+1 en el orden de la
+    línea). Esto garantiza que cada fila de route_candidates.csv corresponde
+    exactamente a una arista elemental del grafo y puede hacer matching directo
+    con edges.csv mediante (start_stop_id, end_stop_id) ↔ (u, v).
 
-    Para cada subtramo se calcula:
-    - tol_prox  : bin km más cercano de [1, 2, 5, 10, 15, 20]
-    - km_offset : length_real_km − tol_prox  (diferencia signed respecto al criterio)
-    - score     : straightness_c − base_curve_penalty · |km_offset| / (tol_prox + ε)
+    Campos emitidos por fila:
+    - start_stop_id / end_stop_id : GTFS Stop IDs reales (no índices posicionales)
+    - tol_prox   : bin km más cercano de [1, 2, 5, 10, 15, 20]
+    - km_offset  : length_real_km − tol_prox
+    - score      : straightness_c − base_curve_penalty · |km_offset| / (tol_prox + ε)
     - accepted_by_tolerance : |km_offset| / tol_prox ≤ base_km_tolerance_ratio
 
     Si el archivo maestro ya existe y contiene filas para este scenario_id,
     esas filas se eliminan antes de escribir las nuevas.
     """
-    _bins = KM_BINS  # bins metodológicos: [1, 2, 5, 10, 15, 20] km
+    _bins = KM_BINS
 
     metrics = {
         "num_nodes": int(G.number_of_nodes()) if G is not None else 0,
@@ -497,6 +503,14 @@ def compute_and_save_metrics(
 
     if gdf_lines is not None and not gdf_lines.empty:
         gdf_proj = gdf_lines.to_crs(epsg=3857)
+
+        # Construir lookup line_name → stop_ids desde line_orders cuando esté disponible
+        stop_ids_by_line: Dict[str, list] = {}
+        if line_orders:
+            for entry in line_orders:
+                lname, _ordered, sids = entry
+                stop_ids_by_line[lname] = sids
+
         for idx, row in gdf_lines.iterrows():
             geom = row.geometry
             if geom is None or geom.is_empty:
@@ -504,14 +518,34 @@ def compute_and_save_metrics(
             geom_proj = gdf_proj.loc[idx].geometry
             coords_lonlat = list(geom.coords)
             coords_proj = list(geom_proj.coords)
-            if len(coords_proj) < 2:
-                continue
-            cum = [0.0]
-            for i in range(1, len(coords_proj)):
-                a = coords_proj[i - 1]
-                b = coords_proj[i]
-                cum.append(cum[-1] + float(np.hypot(b[0] - a[0], b[1] - a[1])))
             n = len(coords_proj)
+            if n < 2:
+                continue
+
+            line_name = row.get("Line", "")
+            stop_ids = stop_ids_by_line.get(line_name, [])
+            # Si no hay stop_ids para esta línea (p.ej. carga desde CSV existente),
+            # no se pueden emitir IDs reales: se omite la fila con advertencia.
+            if len(stop_ids) != n:
+                if stop_ids:
+                    logger.warning(
+                        "[compute_and_save_metrics] línea '%s': len(stop_ids)=%d != len(coords)=%d — omitida",
+                        line_name, len(stop_ids), n,
+                    )
+                else:
+                    logger.warning(
+                        "[compute_and_save_metrics] línea '%s': sin stop_ids disponibles — omitida. "
+                        "Asegúrate de pasar line_orders al llamar esta función.",
+                        line_name,
+                    )
+                continue
+
+            cum = [0.0]
+            for k in range(1, n):
+                a = coords_proj[k - 1]
+                b = coords_proj[k]
+                cum.append(cum[-1] + float(np.hypot(b[0] - a[0], b[1] - a[1])))
+
             for i in range(n - 1):
                 for j in range(i + 1, n):
                     path_len = cum[j] - cum[i]
@@ -534,11 +568,12 @@ def compute_and_save_metrics(
                     accepted_by_tolerance = abs(km_offset) / (tol_prox + 1e-9) <= base_km_tolerance_ratio
 
                     seg_geom = LineString(coords_lonlat[i: j + 1])
+
                     route_metrics_rows.append({
                         "scenario_id": scenario_id,
-                        "line": row.get("Line", ""),
-                        "start_idx": i,
-                        "end_idx": j,
+                        "line": line_name,
+                        "start_stop_id": stop_ids[i],
+                        "end_stop_id": stop_ids[j],
                         "length_real_km": length_real_km,
                         "length_straight_km": length_straight_km,
                         "straightness_index": straightness_index,
@@ -573,8 +608,9 @@ def compute_and_save_metrics(
 
     df_master.to_csv(master_csv_path, index=False)
     logger.info(
-        f"[compute_and_save_metrics] route_candidates.csv actualizado: "
-        f"{len(df_master)} filas totales ({len(df_new)} nuevas para '{scenario_id}')"
+        "[compute_and_save_metrics] route_candidates.csv actualizado: "
+        "%d filas totales (%d nuevas para '%s')",
+        len(df_master), len(df_new), scenario_id,
     )
 
     num_accepted = int(df_new["accepted_by_tolerance"].fillna(False).sum()) if not df_new.empty else 0
@@ -652,81 +688,81 @@ def general_pipeline(
         # load_processed_gdfs devuelve gdf_nodes, gdf_lines
         gdf_nodes, gdf_lines = load_processed_gdfs(str(graph_dir))
         # Reconstruir G a partir de nodes/edges CSVs
-        print("[gen_pipeline] Reconstructing NetworkX graph from CSVs")
-        G = nx.MultiDiGraph()
-        node_meta = {}
-        for _, row in gdf_nodes.iterrows():
-            node_id = str(row["GTFS Stop ID"])
-            attrs = {k: row[k] for k in row.index if k not in {"GTFS Stop ID", "geometry", "geometry_wkt"}}
-            # Normalizar nombres de coordenadas para mantener compatibilidad
-            # con la estructura esperada por el resto del código (x,y,lon,lat)
-            if "_x" in row.index and pd.notna(row.get("_x")):
-                try:
-                    attrs["x"] = float(row.get("_x"))
-                except Exception:
-                    pass
-            elif "x" in row.index and pd.notna(row.get("x")):
-                try:
-                    attrs["x"] = float(row.get("x"))
-                except Exception:
-                    pass
-            if "_y" in row.index and pd.notna(row.get("_y")):
-                try:
-                    attrs["y"] = float(row.get("_y"))
-                except Exception:
-                    pass
-            elif "y" in row.index and pd.notna(row.get("y")):
-                try:
-                    attrs["y"] = float(row.get("y"))
-                except Exception:
-                    pass
-            if "GTFS Longitude" in row.index and pd.notna(row.get("GTFS Longitude")):
-                try:
-                    attrs["lon"] = float(row.get("GTFS Longitude"))
-                except Exception:
-                    pass
-            if "GTFS Latitude" in row.index and pd.notna(row.get("GTFS Latitude")):
-                try:
-                    attrs["lat"] = float(row.get("GTFS Latitude"))
-                except Exception:
-                    pass
-            # preservar geometría si está presente
-            if "geometry" in row.index and row["geometry"] is not None:
-                attrs["geometry"] = row["geometry"]
-            G.add_node(node_id, **attrs)
-            node_meta[node_id] = attrs
+        # print("[gen_pipeline] Reconstructing NetworkX graph from CSVs")
+        # G = nx.MultiDiGraph()
+        # node_meta = {}
+        # for _, row in gdf_nodes.iterrows():
+        #     node_id = str(row["GTFS Stop ID"])
+        #     attrs = {k: row[k] for k in row.index if k not in {"GTFS Stop ID", "geometry", "geometry_wkt"}}
+        #     # Normalizar nombres de coordenadas para mantener compatibilidad
+        #     # con la estructura esperada por el resto del código (x,y,lon,lat)
+        #     if "_x" in row.index and pd.notna(row.get("_x")):
+        #         try:
+        #             attrs["x"] = float(row.get("_x"))
+        #         except Exception:
+        #             pass
+        #     elif "x" in row.index and pd.notna(row.get("x")):
+        #         try:
+        #             attrs["x"] = float(row.get("x"))
+        #         except Exception:
+        #             pass
+        #     if "_y" in row.index and pd.notna(row.get("_y")):
+        #         try:
+        #             attrs["y"] = float(row.get("_y"))
+        #         except Exception:
+        #             pass
+        #     elif "y" in row.index and pd.notna(row.get("y")):
+        #         try:
+        #             attrs["y"] = float(row.get("y"))
+        #         except Exception:
+        #             pass
+        #     if "GTFS Longitude" in row.index and pd.notna(row.get("GTFS Longitude")):
+        #         try:
+        #             attrs["lon"] = float(row.get("GTFS Longitude"))
+        #         except Exception:
+        #             pass
+        #     if "GTFS Latitude" in row.index and pd.notna(row.get("GTFS Latitude")):
+        #         try:
+        #             attrs["lat"] = float(row.get("GTFS Latitude"))
+        #         except Exception:
+        #             pass
+        #     # preservar geometría si está presente
+        #     if "geometry" in row.index and row["geometry"] is not None:
+        #         attrs["geometry"] = row["geometry"]
+        #     G.add_node(node_id, **attrs)
+        #     node_meta[node_id] = attrs
 
-        # Cargar edges.csv manualmente
-        try:
-            edf = pd.read_csv(str(graph_edges_csv))
-            for _, r in edf.iterrows():
-                u = r["u"]
-                v = r["v"]
-                key = r.get("key", None)
-                edata = {k: v for k, v in r.items() if k not in {"u", "v", "key", "geometry_wkt"}}
-                if "geometry_wkt" in r and pd.notna(r["geometry_wkt"]) and r["geometry_wkt"] != "":
-                    try:
-                        edata["geometry"] = wkt.loads(r["geometry_wkt"])
-                    except Exception:
-                        pass
-                if key is not None and not pd.isna(key):
-                    try:
-                        G.add_edge(u, v, key=key, **edata)
-                    except Exception:
-                        G.add_edge(u, v, **edata)
-                else:
-                    G.add_edge(u, v, **edata)
-        except Exception as e:
-            print(f"[gen_pipeline] Warning: failed reading edges.csv: {e}; graph may be incomplete")
+        # # Cargar edges.csv manualmente
+        # try:
+        #     edf = pd.read_csv(str(graph_edges_csv))
+        #     for _, r in edf.iterrows():
+        #         u = r["u"]
+        #         v = r["v"]
+        #         key = r.get("key", None)
+        #         edata = {k: v for k, v in r.items() if k not in {"u", "v", "key", "geometry_wkt"}}
+        #         if "geometry_wkt" in r and pd.notna(r["geometry_wkt"]) and r["geometry_wkt"] != "":
+        #             try:
+        #                 edata["geometry"] = wkt.loads(r["geometry_wkt"])
+        #             except Exception:
+        #                 pass
+        #         if key is not None and not pd.isna(key):
+        #             try:
+        #                 G.add_edge(u, v, key=key, **edata)
+        #             except Exception:
+        #                 G.add_edge(u, v, **edata)
+        #         else:
+        #             G.add_edge(u, v, **edata)
+        # except Exception as e:
+        #     print(f"[gen_pipeline] Warning: failed reading edges.csv: {e}; graph may be incomplete")
 
     else:
         gdf_nodes = _load_nodes_from_csv(stations_csv_path)
 
-        # 2) build line geometries and ordering
-        gdf_lines, line_orders = _build_lines_from_nodes(gdf_nodes)
+    # 2) build line geometries and ordering
+    gdf_lines, line_orders = _build_lines_from_nodes(gdf_nodes)
 
-        # 3) build structural graph (nodes + spatial edges)
-        G, node_meta = _build_graph_from_nodes_and_lines(gdf_nodes, line_orders)
+    # 3) build structural graph (nodes + spatial edges)
+    G, node_meta = _build_graph_from_nodes_and_lines(gdf_nodes, line_orders)
 
     # --- Si hay stop_times disponibles, limpiar y calcular tiempo promedio por arista ---
     # stop_times: debe contener columnas como 'trip_uid','stop_id','arrival_time','departure_time'
@@ -825,6 +861,7 @@ def general_pipeline(
             G,
             gdf_lines,
             scenario_id=scenario_id,
+            line_orders=line_orders if "line_orders" in dir() else None,
         )
         logger.info(f"[gen_pipeline] Computed preprocessing metrics: {metrics}")
     except Exception as e:

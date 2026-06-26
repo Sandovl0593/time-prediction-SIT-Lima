@@ -3,6 +3,7 @@ env/
 __pycache__/
 */__pycache__/
 **/processed/*/*.json
+**/processed/*/*.log
 **/*.csv
 outputs/
 topsegments/

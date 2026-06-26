@@ -462,25 +462,22 @@ def _build_subset_mask(
     nodes_path: Path,
     filter_csv_path: Path,
 ) -> Tuple[torch.Tensor, pd.DataFrame]:
-    """Construye máscara booleana para aristas que aparecen como segmentos directos en filter_csv.
+    """Construye máscara booleana para aristas que aparecen en filter_csv.
 
     Estrategia de matching:
-    1. Carga filter_csv y retiene solo rutas 1-hop (geometry_wkt de 2 puntos).
-    2. Carga nodes.csv para construir el dict {pos_idx: GTFS_Stop_ID}.
-    3. Convierte start_idx/end_idx → GTFS Stop IDs.
-    4. Cruza contra (u, v) en edge_graph_df.
+    1. Carga filter_csv y lee start_stop_id/end_stop_id (GTFS IDs reales).
+    2. Cruza directamente contra (u, v) en edge_graph_df — sin conversión de
+       índices posicionales, porque route_candidates.csv ya emite IDs reales.
 
     Desambiguación de aristas paralelas:
-    En un MultiDiGraph puede existir más de una arista (u, v, key). Para no
-    contaminar la máscara con aristas incorrectas se prefieren las aristas con
-    is_observed=1.0 (aristas con tiempo de viaje observado) cuando existen múltiples
-    candidatos con el mismo par (u, v). Si filter_csv contiene una columna 'edge_key',
-    se usa el triple (u, v, edge_key) para matching exacto.
+    Si un par (u, v) tiene tanto aristas espaciales como observadas, se
+    prefieren las observadas para no contaminar la evaluación. Si filter_csv
+    contiene una columna 'edge_key', se usa el triple (u, v, edge_key) para
+    matching exacto.
 
     Returns:
-        in_subset: bool tensor de shape [len(edge_graph_df)]
-        meta_df: DataFrame con metadata de ruta para las aristas matched
-                 (edge_pos_idx, u, v, straightness_index, tol_prox, km_offset, line, ...)
+        in_subset : bool tensor de shape [len(edge_graph_df)]
+        meta_df   : DataFrame con metadata de ruta para las aristas matched
     """
     n = len(edge_graph_df)
     empty_meta = pd.DataFrame()
@@ -491,54 +488,70 @@ def _build_subset_mask(
         logger.warning("_build_subset_mask: no se pudo leer %s — %s", filter_csv_path, exc)
         return torch.zeros(n, dtype=torch.bool), empty_meta
 
-    # Retener solo rutas 1-hop: geometry_wkt con exactamente 2 puntos coordenados
-    if "geometry_wkt" in filter_df.columns:
-        def _is_direct(wkt_str: str) -> bool:
-            if not isinstance(wkt_str, str) or not wkt_str.strip():
-                return False
+    # Determinar columnas de ID de nodo
+    # Soporte para CSVs nuevos (start_stop_id/end_stop_id) y legacy (start_idx/end_idx + nodes.csv)
+    has_stop_ids = "start_stop_id" in filter_df.columns and "end_stop_id" in filter_df.columns
+
+    if has_stop_ids:
+        filter_df["_u_str"] = filter_df["start_stop_id"].astype(str)
+        filter_df["_v_str"] = filter_df["end_stop_id"].astype(str)
+    else:
+        # Fallback legacy: convertir start_idx/end_idx mediante nodes.csv
+        logger.warning(
+            "_build_subset_mask: filter_csv no contiene start_stop_id/end_stop_id; "
+            "usando fallback legacy con nodes.csv. Regenera route_candidates.csv para evitar esto."
+        )
+        try:
+            nodes_df = _safe_read_csv(nodes_path)
+            node_ids: list = nodes_df["GTFS Stop ID"].astype(str).tolist()
+        except Exception as exc:
+            logger.warning("_build_subset_mask: no se pudo leer nodes.csv — %s", exc)
+            return torch.zeros(n, dtype=torch.bool), empty_meta
+
+        # Filtro legacy: solo retener rutas 1-hop (geometry_wkt de exactamente 2 puntos)
+        if "geometry_wkt" in filter_df.columns:
+            from shapely import wkt as _wkt
+            def _is_direct(wkt_str: str) -> bool:
+                if not isinstance(wkt_str, str) or not wkt_str.strip():
+                    return False
+                try:
+                    return len(list(_wkt.loads(wkt_str).coords)) == 2
+                except Exception:
+                    return False
+            filter_df = filter_df[filter_df["geometry_wkt"].apply(_is_direct)].copy()
+
+        if filter_df.empty:
+            logger.warning(
+                "_build_subset_mask: ninguna ruta directa (1-hop) encontrada en %s", filter_csv_path
+            )
+            return torch.zeros(n, dtype=torch.bool), empty_meta
+
+        def _idx_to_gtfs(idx) -> str:
             try:
-                return len(list(wkt.loads(wkt_str).coords)) == 2
-            except Exception:
-                return False
-        filter_df = filter_df[filter_df["geometry_wkt"].apply(_is_direct)].copy()
+                i = int(idx)
+                if 0 <= i < len(node_ids):
+                    return node_ids[i]
+            except (ValueError, TypeError):
+                pass
+            return str(idx)
+
+        filter_df["_u_str"] = filter_df["start_idx"].apply(_idx_to_gtfs)
+        filter_df["_v_str"] = filter_df["end_idx"].apply(_idx_to_gtfs)
 
     if filter_df.empty:
-        logger.warning(
-            "_build_subset_mask: ninguna ruta directa (1-hop) encontrada en %s", filter_csv_path
-        )
+        logger.warning("_build_subset_mask: filter_csv vacío tras preprocesado — %s", filter_csv_path)
         return torch.zeros(n, dtype=torch.bool), empty_meta
 
-    # Construir mapeo pos_idx → GTFS Stop ID desde nodes.csv
-    try:
-        nodes_df = _safe_read_csv(nodes_path)
-        node_ids: list = nodes_df["GTFS Stop ID"].astype(str).tolist()
-    except Exception as exc:
-        logger.warning("_build_subset_mask: no se pudo leer nodes.csv — %s", exc)
-        return torch.zeros(n, dtype=torch.bool), empty_meta
-
-    def _idx_to_gtfs(idx) -> str:
-        """Convierte un índice posicional a GTFS Stop ID; si falla trata el valor como ID directo."""
-        try:
-            i = int(idx)
-            if 0 <= i < len(node_ids):
-                return node_ids[i]
-        except (ValueError, TypeError):
-            pass
-        return str(idx)  # fallback: tratarlo como GTFS ID directamente
-
-    filter_df["_u_str"] = filter_df["start_idx"].apply(_idx_to_gtfs)
-    filter_df["_v_str"] = filter_df["end_idx"].apply(_idx_to_gtfs)
     filter_pairs: set = set(zip(filter_df["_u_str"], filter_df["_v_str"]))
 
-    # Si el CSV de filtro incluye 'edge_key', usar triple (u, v, edge_key) para
-    # matching exacto y evitar seleccionar aristas paralelas incorrectas.
+    # Matching exacto por triple (u, v, edge_key) si está disponible
     use_edge_key = "edge_key" in filter_df.columns
     if use_edge_key:
         filter_triples: set = set(zip(
             filter_df["_u_str"], filter_df["_v_str"], filter_df["edge_key"].astype(str)
         ))
 
-    # Construir lookup de metadata por par (u, v) — primer match gana
+    # Lookup de metadata por par (u, v) — primer match gana
     meta_cols = ["_u_str", "_v_str"] + [
         c for c in ("straightness_index", "tol_prox", "km_offset", "line", "score", "config_score")
         if c in filter_df.columns
@@ -549,13 +562,8 @@ def _build_subset_mask(
         if pair_uv not in meta_lookup:
             meta_lookup[pair_uv] = {k: v for k, v in row.items() if k not in ("_u_str", "_v_str")}
 
-    # Construir máscara y filas de metadata.
-    # Para desambiguar aristas paralelas se prefieren las que tienen is_observed=1.0:
-    # si un par (u,v) tiene tanto una arista espacial como una observada, solo la
-    # observada entra en la máscara, evitando contaminar la evaluación.
+    # Desambiguación de aristas paralelas: preferir is_observed=1
     has_is_observed = "is_observed" in edge_graph_df.columns
-
-    # Primera pasada: marcar qué pares (u,v) tienen al menos una arista observed
     if has_is_observed:
         observed_pairs: set = set(
             (str(r["u"]), str(r["v"]))
@@ -574,12 +582,9 @@ def _build_subset_mask(
         pair_uv = (u_str, v_str)
 
         if use_edge_key:
-            # Matching exacto por triple (u, v, edge_key)
             edge_key_str = str(row.get("key", ""))
             matched = (u_str, v_str, edge_key_str) in filter_triples
         elif pair_uv in filter_pairs:
-            # Desambiguación: si existen aristas observed para este par,
-            # excluir las no-observed para no mezclar tipos de arista paralela.
             if observed_pairs and pair_uv in observed_pairs:
                 is_obs = has_is_observed and float(row.get("is_observed", 0)) == 1.0
                 matched = is_obs
@@ -1222,21 +1227,33 @@ def train_and_evaluate(
 
     # --- Evaluación sobre master_segments ---
     if evaluate:
-        _default_master  = PROJECT_ROOT / "src" / "topsegments" / "master_segments.csv"
-        # _default_straight = PROJECT_ROOT / "src" / "outputs" / "routes" / "straight_routes.csv"
-        _master_path  = Path(master_csv)  if master_csv  is not None else _default_master
-        # _straight_path = Path(straight_csv) if straight_csv is not None else _default_straight
+        _default_master = PROJECT_ROOT / "src" / "topsegments" / "master_segments.csv"
+        _default_straight = PROJECT_ROOT / "src" / "outputs" / "routes" / "straight_routes.csv"
+        _master_path = Path(master_csv) if master_csv is not None else _default_master
 
-        # for _subset_name, _csv_path in (("straight", _straight_path)):
         if _master_path.exists():
-            run_logger.info("Evaluando master CSV")
+            run_logger.info("Evaluando subconjunto master (master_segments.csv)...")
             evaluate_on_subset(
                 model, data, edge_graph_df, nodes_path,
-                _master_path, "straight", run_dir, device,
+                _master_path, "master", run_dir, device,  # subset_name="master"
+            )
+        else:
+            run_logger.warning(
+                "master_segments.csv no encontrado en %s — omitido. "
+                "Ejecuta --route-analysis para generarlo.",
+                _master_path,
+            )
+
+        if _default_straight.exists():
+            run_logger.info("Evaluando subconjunto straight (straight_routes.csv)...")
+            evaluate_on_subset(
+                model, data, edge_graph_df, nodes_path,
+                _default_straight, "straight", run_dir, device,
             )
         else:
             run_logger.info(
-                "CSV straight no encontrado en %s — omitido", _master_path,
+                "straight_routes.csv no encontrado en %s — omitido.",
+                _default_straight,
             )
 
     # --- Plots de entrenamiento ---

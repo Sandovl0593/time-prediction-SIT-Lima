@@ -5,24 +5,24 @@ from pathlib import Path
 from typing import Dict, List
 
 # Bins de kilometraje para clasificación de rutas (tol_prox)
-KM_BINS: List[float] = [1.0, 2.0, 5.0, 10.0, 15.0, 20.0]
+KM_BINS: List[float] = [5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0]
 
 # Parámetros ideales únicos para generación del CSV maestro de rutas.
 # Reemplazan el esquema experimental A/B/C: una sola configuración
 # con los valores más estrictos/representativos.
 IDEAL_CURVE_PENALTY: float = 0.5   # penaliza fuertemente las curvas
-IDEAL_KM_TOLERANCE: float = 0.2    # ±20 % del bin más cercano
+IDEAL_KM_TOLERANCE: float = 0.5    # ±50 % del bin más cercano
 
 # Escenarios de evaluación post-entrenamiento derivados del CSV maestro.
 # No son parámetros de generación: se aplican sobre eval_master/predictions.csv
 # para producir sub-evaluaciones sin necesidad de CSVs externos adicionales.
 # A: estricto — km_tolerance=0.2, curve_penalty=0.5
-# B: equilibrado — km_tolerance=0.3, curve_penalty=0.3
-# C: permisivo — km_tolerance=0.4, curve_penalty=0.2
+# B: equilibrado — km_tolerance=0.5, curve_penalty=0.3
+# C: permisivo — km_tolerance=0.8, curve_penalty=0.2
 EVAL_SCENARIOS: Dict[str, Dict[str, float]] = {
     "A": {"km_tolerance": 0.2, "curve_penalty": 0.5},
-    "B": {"km_tolerance": 0.3, "curve_penalty": 0.3},
-    "C": {"km_tolerance": 0.4, "curve_penalty": 0.2}
+    "B": {"km_tolerance": 0.5, "curve_penalty": 0.3},
+    "C": {"km_tolerance": 0.8, "curve_penalty": 0.2}
 }
 STRAIGHT_THRESHOLD: float = 0.9  # índice de rectitud mínimo para rutas rectas
 

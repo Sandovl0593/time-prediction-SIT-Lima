@@ -17,7 +17,7 @@ from typing import Optional
 import pandas as pd
 import numpy as np
 
-from src.config import Config
+from src.config import Config, STRAIGHT_THRESHOLD
 
 # Rutas por defecto (relativas a la raíz del proyecto)
 _DEFAULT_MASTER_CSV = Path("src") / "outputs" / "routes" / "route_candidates.csv"
@@ -99,24 +99,24 @@ def build_routes_distribution(df: pd.DataFrame) -> pd.DataFrame:
     return dist
 
 
-# def build_straight_routes(
-#     df: pd.DataFrame,
-#     straightness_threshold: Optional[float] = None,
-# ) -> pd.DataFrame:
-#     """Filtra rutas rectas o casi rectas según el umbral de rectitud.
+def build_straight_routes(
+    df: pd.DataFrame,
+    straightness_threshold: Optional[float] = None,
+) -> pd.DataFrame:
+    """Filtra rutas rectas o casi rectas según el umbral de rectitud.
 
-#     Args:
-#         df: DataFrame del CSV maestro.
-#         straightness_threshold: Umbral mínimo de straightness_index.
-#             Si es None, usa Config.straightness_threshold (0.9 por defecto).
-#     """
-#     threshold = (
-#         straightness_threshold
-#         if straightness_threshold is not None
-#         else Config().straightness_threshold
-#     )
-#     mask = df["straightness_index"].notna() & (df["straightness_index"] >= threshold)
-#     return df[mask].copy()
+    Args:
+        df: DataFrame del CSV maestro.
+        straightness_threshold: Umbral mínimo de straightness_index.
+            Si es None, usa Config.straightness_threshold (0.9 por defecto).
+    """
+    threshold = (
+        straightness_threshold
+        if straightness_threshold is not None
+        else Config().straightness_threshold
+    )
+    mask = df["straightness_index"].notna() & (df["straightness_index"] >= threshold)
+    return df[mask].copy()
 
 
 def build_straight_routes_by_config(
@@ -180,27 +180,27 @@ def run_route_analysis(
     artifacts["routes_distribution"] = str(dist_path)
 
     # straight_routes.csv
-    # straight = build_straight_routes(df, straightness_threshold=straightness_threshold)
-    # straight_path = out_dir / "straight_routes.csv"
-    # straight.to_csv(straight_path, index=False)
-    # artifacts["straight_routes"] = str(straight_path)
+    straight = build_straight_routes(df, straightness_threshold=STRAIGHT_THRESHOLD)
+    straight_path = out_dir / "straight_routes.csv"
+    straight.to_csv(straight_path, index=False)
+    artifacts["straight_routes"] = str(straight_path)
 
     # straight_routes_by_config.json
-    # by_config = build_straight_routes_by_config(straight)
-    # by_config_path = out_dir / "straight_routes_by_config.json"
-    # with open(by_config_path, "w", encoding="utf-8") as fh:
-    #     json.dump(by_config, fh, indent=2, ensure_ascii=False, default=str)
-    # artifacts["straight_routes_by_config"] = str(by_config_path)
+    by_config = build_straight_routes_by_config(straight)
+    by_config_path = out_dir / "straight_routes_by_config.json"
+    with open(by_config_path, "w", encoding="utf-8") as fh:
+        json.dump(by_config, fh, indent=2, ensure_ascii=False, default=str)
+    artifacts["straight_routes_by_config"] = str(by_config_path)
 
     # master_segments.csv — CSV maestro con parámetros ideales únicos
-    # try:
-    #     master_artifacts = export_master_segments(
-    #         straight_csv=straight_path,
-    #         straightness_threshold=straightness_threshold,
-    #     )
-    #     artifacts.update(master_artifacts)
-    # except Exception as e:
-    #     artifacts["master_export_error"] = str(e)
+    try:
+        master_artifacts = export_master_segments(
+            straight_csv=straight_path,
+            straightness_threshold=STRAIGHT_THRESHOLD,
+        )
+        artifacts.update(master_artifacts)
+    except Exception as e:
+        artifacts["master_export_error"] = str(e)
 
     return artifacts
 
