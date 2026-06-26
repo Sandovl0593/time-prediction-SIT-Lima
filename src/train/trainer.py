@@ -19,8 +19,9 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch_geometric.data import Data
+from sklearn.preprocessing import StandardScaler
 
-from src.config import Config
+from src.config import Config, EVAL_SCENARIOS, STRAIGHT_THRESHOLD
 from src.models.gat_model import TravelTimeGAT
 from src.models.gatv2_model import TravelTimeGATv2
 from src.models.graphsage_model import TravelTimeGraphSAGE
@@ -33,6 +34,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PROCESSED_GRAPH_DIR = PROJECT_ROOT / "src" / "data" / "processed" / "graph"
 
 TARGET_CANDIDATES = ("travel_time_s", "target", "y")
+_EPS = 1e-9  # evitar división por cero en ratios km
 
 
 def _coerce_scalar(v):
@@ -93,8 +95,18 @@ def _edge_role_from_row(row: pd.Series) -> str:
     return "other"
 
 
-def _load_multidigraph_from_csv(nodes_df: pd.DataFrame, edges_df: pd.DataFrame) -> nx.MultiDiGraph:
-    """Reconstruye el MultiDiGraph respetando u, v, key y atributos por arista."""
+def _load_multidigraph_from_csv(
+    nodes_df: pd.DataFrame,
+    edges_df: pd.DataFrame,
+    load_geometry: bool = True,
+) -> nx.MultiDiGraph:
+    """Reconstruye el MultiDiGraph respetando u, v, key y atributos por arista.
+
+    Args:
+        load_geometry: Si es False, omite la reconstrucción de geometrías Shapely
+            (WKT). Usar False para entrenamiento donde las geometrías no se usan;
+            usar True (default) para visualización y análisis espacial.
+    """
     G = nx.MultiDiGraph()
 
     # Nodos
@@ -107,7 +119,7 @@ def _load_multidigraph_from_csv(nodes_df: pd.DataFrame, edges_df: pd.DataFrame) 
                 continue
             attrs[col] = _coerce_scalar(val)
 
-        if "geometry_wkt" in row and pd.notna(row["geometry_wkt"]) and str(row["geometry_wkt"]).strip():
+        if load_geometry and "geometry_wkt" in row and pd.notna(row["geometry_wkt"]) and str(row["geometry_wkt"]).strip():
             attrs["geometry"] = wkt.loads(str(row["geometry_wkt"]))
 
         G.add_node(node_id, **attrs)
@@ -126,7 +138,7 @@ def _load_multidigraph_from_csv(nodes_df: pd.DataFrame, edges_df: pd.DataFrame) 
             if col in {"u", "v", "key"}:
                 continue
             if col == "geometry_wkt":
-                if pd.notna(val) and str(val).strip():
+                if load_geometry and pd.notna(val) and str(val).strip():
                     attrs["geometry"] = wkt.loads(str(val))
             else:
                 attrs[col] = _coerce_scalar(val)
@@ -154,7 +166,7 @@ def _choose_target_column(edges_df: pd.DataFrame) -> str:
             return normalized[candidate]
     raise ValueError(
         "No se encontró una columna objetivo en edges.csv. "
-        "Se esperaba algo como 'travel_time_s'."
+        "Se espera algo como 'travel_time_s'."
     )
 
 
@@ -258,10 +270,17 @@ def _build_masks(
 def _load_processed_graph_as_pyg(
     processed_dir: Path,
     config: Config,
-) -> Tuple[Data, Dict[str, object]]:
+) -> Tuple[Data, Dict[str, object], pd.DataFrame]:
     """
     Carga nodes.csv y edges.csv, reconstruye el MultiDiGraph y lo convierte
     a torch_geometric.data.Data sin colapsar aristas paralelas.
+
+    Returns:
+        (data, metadata, edge_graph_df)
+        - data      : objeto Data de PyG listo para entrenamiento.
+        - metadata  : dict ligero y JSON-serializable con estadísticas del grafo.
+        - edge_graph_df : DataFrame con una fila por arista; incluye columna 'key'
+          para identificar aristas paralelas (u, v, key) de forma unívoca.
     """
     nodes_path = processed_dir / "nodes.csv"
     edges_path = processed_dir / "edges.csv"
@@ -280,8 +299,11 @@ def _load_processed_graph_as_pyg(
     if "u" not in edges_df.columns or "v" not in edges_df.columns:
         raise ValueError("edges.csv debe contener las columnas 'u' y 'v'.")
 
-    # Reconstrucción fiel del MultiDiGraph
-    G = _load_multidigraph_from_csv(nodes_df, edges_df)
+    # Reconstrucción fiel del MultiDiGraph.
+    # NetworkX se usa aquí para preservar las keys de aristas paralelas (u,v,key)
+    # y el orden original de iteración. La geometría no se carga para ahorrar
+    # memoria y tiempo durante el entrenamiento.
+    G = _load_multidigraph_from_csv(nodes_df, edges_df, load_geometry=False)
 
     node_ids = nodes_df["GTFS Stop ID"].astype(str).tolist()
     node_to_idx = {node_id: i for i, node_id in enumerate(node_ids)}
@@ -355,7 +377,8 @@ def _load_processed_graph_as_pyg(
 
     # Target solo para aristas observadas; las espaciales quedan sin supervisión
     y_raw = pd.to_numeric(edge_graph_df[target_col], errors="coerce")
-    labeled_idx = np.where(~y_raw.isna().to_numpy())[0]
+    labeled_mask = ~y_raw.isna()
+    labeled_idx = np.where(labeled_mask.to_numpy())[0]
 
     if labeled_idx.size == 0:
         raise ValueError(
@@ -374,7 +397,17 @@ def _load_processed_graph_as_pyg(
 
     x = torch.tensor(node_feature_df.to_numpy(dtype=np.float32), dtype=torch.float)
     edge_attr = torch.tensor(edge_feature_df.to_numpy(dtype=np.float32), dtype=torch.float)
-    y = torch.tensor(y_raw.fillna(0.0).to_numpy(dtype=np.float32), dtype=torch.float)
+    
+    # Aclaración sobre target: NaN para aristas sin observación (no cero, que es un valor físico válido).
+    y_norm = np.full(len(y_raw), np.nan, dtype=np.float32)
+    scaler = StandardScaler()
+    y_norm[labeled_mask] = scaler.fit_transform(
+        y_raw[labeled_mask].to_numpy().reshape(-1, 1)
+    ).ravel()
+    y = torch.tensor(
+        np.nan_to_num(y_norm),
+        dtype=torch.float32,
+    )
 
     train_mask = torch.zeros(len(edge_graph_df), dtype=torch.bool)
     val_mask = torch.zeros(len(edge_graph_df), dtype=torch.bool)
@@ -399,6 +432,7 @@ def _load_processed_graph_as_pyg(
         train_mask=train_mask,
         val_mask=val_mask,
         test_mask=test_mask,
+        target_scaler=scaler,
     )
 
     metadata: Dict[str, object] = {
@@ -412,16 +446,15 @@ def _load_processed_graph_as_pyg(
         "node_feature_dim": int(x.shape[1]),
         "edge_attr_dim": int(edge_attr.shape[1]),
         "target_col": target_col,
+        "target_scaler": scaler,
         "lines_rows": int(len(lines_df)) if isinstance(lines_df, pd.DataFrame) else 0,
     }
 
     # Detecta patrones repetidos útiles para debug
     duplicate_uv = int(edge_graph_df.duplicated(subset=["u", "v"], keep=False).sum())
     metadata["duplicate_uv_edges"] = duplicate_uv
-    # Non-serializable reference — used for subset evaluation; pop before JSON serialization
-    metadata["_edge_graph_df"] = edge_graph_df
 
-    return data, metadata
+    return data, metadata, edge_graph_df
 
 
 def _build_subset_mask(
@@ -436,6 +469,13 @@ def _build_subset_mask(
     2. Carga nodes.csv para construir el dict {pos_idx: GTFS_Stop_ID}.
     3. Convierte start_idx/end_idx → GTFS Stop IDs.
     4. Cruza contra (u, v) en edge_graph_df.
+
+    Desambiguación de aristas paralelas:
+    En un MultiDiGraph puede existir más de una arista (u, v, key). Para no
+    contaminar la máscara con aristas incorrectas se prefieren las aristas con
+    is_observed=1.0 (aristas con tiempo de viaje observado) cuando existen múltiples
+    candidatos con el mismo par (u, v). Si filter_csv contiene una columna 'edge_key',
+    se usa el triple (u, v, edge_key) para matching exacto.
 
     Returns:
         in_subset: bool tensor de shape [len(edge_graph_df)]
@@ -490,28 +530,68 @@ def _build_subset_mask(
     filter_df["_v_str"] = filter_df["end_idx"].apply(_idx_to_gtfs)
     filter_pairs: set = set(zip(filter_df["_u_str"], filter_df["_v_str"]))
 
-    # Construir lookup de metadata por (u, v) — primer match gana
+    # Si el CSV de filtro incluye 'edge_key', usar triple (u, v, edge_key) para
+    # matching exacto y evitar seleccionar aristas paralelas incorrectas.
+    use_edge_key = "edge_key" in filter_df.columns
+    if use_edge_key:
+        filter_triples: set = set(zip(
+            filter_df["_u_str"], filter_df["_v_str"], filter_df["edge_key"].astype(str)
+        ))
+
+    # Construir lookup de metadata por par (u, v) — primer match gana
     meta_cols = ["_u_str", "_v_str"] + [
         c for c in ("straightness_index", "tol_prox", "km_offset", "line", "score", "config_score")
         if c in filter_df.columns
     ]
     meta_lookup: dict = {}
     for _, row in filter_df[meta_cols].iterrows():
-        key = (row["_u_str"], row["_v_str"])
-        if key not in meta_lookup:
-            meta_lookup[key] = {k: v for k, v in row.items() if k not in ("_u_str", "_v_str")}
+        pair_uv = (row["_u_str"], row["_v_str"])
+        if pair_uv not in meta_lookup:
+            meta_lookup[pair_uv] = {k: v for k, v in row.items() if k not in ("_u_str", "_v_str")}
 
-    # Construir máscara y filas de metadata
+    # Construir máscara y filas de metadata.
+    # Para desambiguar aristas paralelas se prefieren las que tienen is_observed=1.0:
+    # si un par (u,v) tiene tanto una arista espacial como una observada, solo la
+    # observada entra en la máscara, evitando contaminar la evaluación.
+    has_is_observed = "is_observed" in edge_graph_df.columns
+
+    # Primera pasada: marcar qué pares (u,v) tienen al menos una arista observed
+    if has_is_observed:
+        observed_pairs: set = set(
+            (str(r["u"]), str(r["v"]))
+            for _, r in edge_graph_df.iterrows()
+            if float(r.get("is_observed", 0)) == 1.0
+            and (str(r["u"]), str(r["v"])) in filter_pairs
+        )
+    else:
+        observed_pairs = set()
+
     in_subset_list: list = []
     meta_rows: list = []
     for pos_idx, row in edge_graph_df.iterrows():
         u_str = str(row["u"])
         v_str = str(row["v"])
-        key = (u_str, v_str)
-        in_subset_list.append(key in filter_pairs)
-        if key in filter_pairs:
+        pair_uv = (u_str, v_str)
+
+        if use_edge_key:
+            # Matching exacto por triple (u, v, edge_key)
+            edge_key_str = str(row.get("key", ""))
+            matched = (u_str, v_str, edge_key_str) in filter_triples
+        elif pair_uv in filter_pairs:
+            # Desambiguación: si existen aristas observed para este par,
+            # excluir las no-observed para no mezclar tipos de arista paralela.
+            if observed_pairs and pair_uv in observed_pairs:
+                is_obs = has_is_observed and float(row.get("is_observed", 0)) == 1.0
+                matched = is_obs
+            else:
+                matched = True
+        else:
+            matched = False
+
+        in_subset_list.append(matched)
+        if matched:
             meta = {"edge_pos_idx": pos_idx, "u": u_str, "v": v_str}
-            meta.update(meta_lookup.get(key, {}))
+            meta.update(meta_lookup.get(pair_uv, {}))
             meta_rows.append(meta)
 
     in_subset_tensor = torch.tensor(in_subset_list, dtype=torch.bool)
@@ -605,6 +685,228 @@ def evaluate_on_subset(
     return metrics_out
 
 
+# ---------------------------------------------------------------------------
+# Evaluación de escenarios A/B/C derivados del CSV maestro
+# ---------------------------------------------------------------------------
+
+def evaluate_scenarios_from_master(
+    run_dir: Path,
+    straightness_threshold: float = 0.9,
+) -> Dict[str, Optional[Dict]]:
+    """Evalúa escenarios A/B/C filtrando desde eval_master/predictions.csv.
+
+    No depende de CSVs externos: aplica los filtros de cada escenario sobre
+    las predicciones ya calculadas del subconjunto maestro (eval_master).
+
+    Para cada escenario (km_tolerance, curve_penalty) calcula:
+        scenario_score   = straightness_index − curve_penalty · |km_offset| / (tol_prox + ε)
+        score_threshold  = straightness_threshold − curve_penalty · km_tolerance
+        km_filter        = abs(km_offset) / (tol_prox + ε) ≤ km_tolerance
+
+    Guarda en run_dir:
+        eval_scenario_A/metrics.json + predictions.csv
+        eval_scenario_B/...
+        eval_scenario_C/...
+
+    Returns:
+        Dict {letra: metrics_dict_o_None}
+    """
+    import json as _json
+
+    master_preds_path = run_dir / "eval_master" / "predictions.csv"
+    results: Dict[str, Optional[Dict]] = {}
+
+    if not master_preds_path.exists():
+        logger.warning(
+            "evaluate_scenarios_from_master: eval_master/predictions.csv no encontrado en %s — "
+            "asegúrate de incluir 'master' en los subsets de evaluación",
+            run_dir,
+        )
+        return results
+
+    try:
+        df = pd.read_csv(str(master_preds_path), low_memory=False)
+    except Exception as exc:
+        logger.warning("evaluate_scenarios_from_master: error leyendo predictions.csv — %s", exc)
+        return results
+
+    required_cols = {"pred", "target", "tol_prox", "km_offset", "straightness_index"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        logger.warning(
+            "evaluate_scenarios_from_master: columnas faltantes en eval_master/predictions.csv — %s. "
+            "El CSV maestro debe incluir tol_prox, km_offset y straightness_index.",
+            missing,
+        )
+        return results
+
+    df = df.dropna(subset=["pred", "target"])
+
+    for letter, params in EVAL_SCENARIOS.items():
+        km_tol   = float(params["km_tolerance"])
+        curve_pen = float(params["curve_penalty"])
+        out_dir   = run_dir / f"eval_scenario_{letter}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Recomputar score con los parámetros específicos del escenario
+        scenario_score  = df["straightness_index"] - curve_pen * df["km_offset"].abs() / (df["tol_prox"] + _EPS)
+        score_threshold = straightness_threshold - curve_pen * km_tol
+        km_filter       = df["km_offset"].abs() / (df["tol_prox"] + _EPS) <= km_tol
+        score_filter    = scenario_score >= score_threshold
+
+        sub = df[km_filter & score_filter].copy()
+        sub["scenario_score"] = scenario_score[km_filter & score_filter].values
+
+        skipped = sub.empty
+        metrics_out: Dict[str, object] = {
+            "subset_name":     f"scenario_{letter}",
+            "km_tolerance":    km_tol,
+            "curve_penalty":   curve_pen,
+            "score_threshold": score_threshold,
+            "n_eval":          len(sub),
+            "skipped":         skipped,
+        }
+
+        if not skipped:
+            metrics = compute_all_metrics(sub["pred"].values, sub["target"].values)
+            metrics_out.update({k: float(v) for k, v in metrics.items()})
+            sub.to_csv(out_dir / "predictions.csv", index=False)
+            logger.info(
+                "Scenario eval [%s] | n_eval: %d | RMSE: %.4f | R²: %.4f",
+                letter, len(sub),
+                metrics.get("rmse", float("nan")),
+                metrics.get("r2",   float("nan")),
+            )
+        else:
+            logger.warning("Scenario eval [%s]: ninguna arista pasó los filtros", letter)
+
+        with open(out_dir / "metrics.json", "w", encoding="utf-8") as fh:
+            _json.dump(metrics_out, fh, indent=2, ensure_ascii=False)
+
+        results[letter] = metrics_out
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Plots de entrenamiento
+# ---------------------------------------------------------------------------
+
+def _save_plot(fig, path_run: Path, path_reports: Path) -> None:
+    """Guarda una figura en run_dir y en src/outputs/reports/plots/."""
+    for dest in (path_run, path_reports):
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(str(dest), dpi=120, bbox_inches="tight")
+        except Exception as exc:
+            logger.warning("No se pudo guardar plot en %s: %s", dest, exc)
+
+
+def plot_training_results(
+    run_dir: Path,
+    history: Dict[str, list],
+    test_preds: np.ndarray,
+    test_targets: np.ndarray,
+    model_name: str = "",
+) -> None:
+    """Genera y guarda plots clásicos de entrenamiento.
+
+    Plots generados:
+        training_curves.png     — train loss / val RMSE / val R² vs época
+        predictions_scatter.png — pred vs target en test split
+        error_distribution.png  — histograma de (pred − target) en segundos
+        rmse_by_km_bin.png      — RMSE por bin tol_prox (requiere eval_master)
+
+    Cada plot se guarda en run_dir/ y se copia en src/outputs/reports/plots/.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib no disponible; se omiten los plots de entrenamiento.")
+        return
+
+    reports_plot_dir = PROJECT_ROOT / "src" / "outputs" / "reports" / "plots"
+    ts = run_dir.name  # timestamp del run, e.g. 20260625_143022
+
+    def _report_path(name: str) -> Path:
+        return reports_plot_dir / f"{model_name}_{ts}_{name}"
+
+    # --- 1. Curvas de entrenamiento ---
+    if history.get("epoch"):
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        fig.suptitle(f"Curvas de entrenamiento — {model_name.upper()}", fontsize=13)
+
+        axes[0].plot(history["epoch"], history["train_loss"], color="steelblue")
+        axes[0].set_xlabel("Época"); axes[0].set_ylabel("MSE Loss")
+        axes[0].set_title("Train Loss"); axes[0].grid(alpha=0.3)
+
+        axes[1].plot(history["epoch"], history["val_rmse"], color="darkorange")
+        axes[1].set_xlabel("Época"); axes[1].set_ylabel("RMSE (s)")
+        axes[1].set_title("Val RMSE"); axes[1].grid(alpha=0.3)
+
+        axes[2].plot(history["epoch"], history["val_r2"], color="seagreen")
+        axes[2].set_xlabel("Época"); axes[2].set_ylabel("R²")
+        axes[2].set_title("Val R²"); axes[2].grid(alpha=0.3)
+
+        plt.tight_layout()
+        _save_plot(fig, run_dir / "training_curves.png", _report_path("training_curves.png"))
+        plt.close(fig)
+
+    # --- 2. Scatter pred vs target ---
+    if len(test_preds) > 0:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.scatter(test_targets, test_preds, alpha=0.4, s=12, color="steelblue")
+        lo = min(float(test_targets.min()), float(test_preds.min())) * 0.95
+        hi = max(float(test_targets.max()), float(test_preds.max())) * 1.05
+        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1, label="Ideal")
+        ax.set_xlabel("Target (s)"); ax.set_ylabel("Predicción (s)")
+        ax.set_title(f"Predicciones vs Targets — {model_name.upper()}")
+        ax.legend(); ax.grid(alpha=0.3)
+        plt.tight_layout()
+        _save_plot(fig, run_dir / "predictions_scatter.png", _report_path("predictions_scatter.png"))
+        plt.close(fig)
+
+    # --- 3. Distribución de errores ---
+    if len(test_preds) > 0:
+        errors = test_preds - test_targets
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.hist(errors, bins=40, color="steelblue", edgecolor="white", alpha=0.85)
+        ax.axvline(0, color="red", linestyle="--", linewidth=1, label="Error = 0")
+        ax.set_xlabel("Error (pred − target) [s]"); ax.set_ylabel("Frecuencia")
+        ax.set_title(f"Distribución de errores — {model_name.upper()}")
+        ax.legend(); ax.grid(alpha=0.3)
+        plt.tight_layout()
+        _save_plot(fig, run_dir / "error_distribution.png", _report_path("error_distribution.png"))
+        plt.close(fig)
+
+    # --- 4. RMSE por bin tol_prox (eval_master) ---
+    master_preds_path = run_dir / "eval_master" / "predictions.csv"
+    if master_preds_path.exists():
+        try:
+            df_m = pd.read_csv(str(master_preds_path), low_memory=False)
+            if {"pred", "target", "tol_prox"}.issubset(df_m.columns):
+                df_m = df_m.dropna(subset=["pred", "target"])
+                bins_rmse = (
+                    df_m.groupby("tol_prox")
+                    .apply(lambda g: float(np.sqrt(((g["pred"].values - g["target"].values) ** 2).mean())))
+                    .reset_index(name="rmse")
+                )
+                if not bins_rmse.empty:
+                    fig, ax = plt.subplots(figsize=(8, 4))
+                    ax.bar(bins_rmse["tol_prox"].astype(str), bins_rmse["rmse"],
+                           color="steelblue", alpha=0.85, edgecolor="white")
+                    ax.set_xlabel("tol_prox (km)"); ax.set_ylabel("RMSE (s)")
+                    ax.set_title(f"RMSE por bin de km — {model_name.upper()}")
+                    ax.grid(axis="y", alpha=0.3)
+                    plt.tight_layout()
+                    _save_plot(fig, run_dir / "rmse_by_km_bin.png", _report_path("rmse_by_km_bin.png"))
+                    plt.close(fig)
+        except Exception as exc:
+            logger.warning("No se pudo generar rmse_by_km_bin.png: %s", exc)
+
+
 def build_model(config: Config, in_channels: int, edge_attr_dim: int) -> nn.Module:
     """Crea el encoder/decoder elegido."""
     if config.hidden_dim < 2:
@@ -692,6 +994,15 @@ def evaluate_model(
     mask = getattr(data, f"{mask_name}_mask")
     pred_np = preds[mask].detach().cpu().numpy()
     target_np = data.y[mask].detach().cpu().numpy()
+    
+    scaler = getattr(data, "target_scaler", None)
+    if scaler is not None:
+        pred_np = scaler.inverse_transform(
+            pred_np.reshape(-1, 1)
+        ).ravel()
+        target_np = scaler.inverse_transform(
+            target_np.reshape(-1, 1)
+        ).ravel()
     metrics = compute_all_metrics(pred_np, target_np)
     return metrics, preds
 
@@ -778,7 +1089,8 @@ def fit_model(model: nn.Module, data: Data, config: Config, run_dir: Optional[Pa
 def train_and_evaluate(
     config: Config,
     processed_dir: Optional[Path] = None,
-    eval_subsets: Optional[Dict[str, Path]] = None,
+    master_csv: Optional[Path] = None,
+    evaluate: bool = False,
 ) -> Dict[str, object]:
     """Pipeline completo: carga datos, entrena, evalúa en test y guarda artefactos.
 
@@ -787,11 +1099,23 @@ def train_and_evaluate(
     y guarda dentro:
         training.log, history.csv, final_metrics.json,
         test_predictions.csv, best_model.pt
+        training_curves.png, predictions_scatter.png,
+        error_distribution.png, rmse_by_km_bin.png
 
-    Si se pasan eval_subsets ({nombre: Path_a_filter_csv}), tras el entrenamiento
-    evalúa el modelo sobre test_mask ∩ labeled_mask ∩ aristas_del_subconjunto y
-    guarda los artefactos en run_dir/eval_{nombre}/.
-    Solo se consideran aristas con travel_time_s (no-NaN) que estén en el test_mask.
+    Evaluación de subconjuntos (en orden):
+    1. eval_master/      — subconjunto maestro de master_segments.csv
+    2. eval_straight/    — rutas rectas de straight_routes.csv
+    3. eval_scenario_A/  — derivado de eval_master filtrando por EVAL_SCENARIOS["A"]
+       eval_scenario_B/  — ídem para B
+       eval_scenario_C/  — ídem para C
+       Los escenarios A/B/C no requieren CSVs externos: se calculan sobre
+       las predicciones de eval_master usando km_offset y curve_penalty_score.
+
+    Args:
+        master_csv:   Ruta a master_segments.csv. Si es None, se busca en la
+                      ruta por defecto src/topsegments/master_segments.csv.
+        straight_csv: Ruta a straight_routes.csv. Si es None, se busca en la
+                      ruta por defecto src/outputs/routes/straight_routes.csv.
     """
     import datetime
 
@@ -811,9 +1135,7 @@ def train_and_evaluate(
     processed_dir = Path(processed_dir) if processed_dir is not None else DEFAULT_PROCESSED_GRAPH_DIR
     run_logger.info(f"Cargando grafo procesado desde: {processed_dir}")
 
-    data, metadata = _load_processed_graph_as_pyg(processed_dir, config)
-    # Extraer edge_graph_df antes de pasar metadata a serialización
-    edge_graph_df: pd.DataFrame = metadata.pop("_edge_graph_df", pd.DataFrame())
+    data, metadata, edge_graph_df = _load_processed_graph_as_pyg(processed_dir, config)
     nodes_path = processed_dir / "nodes.csv"
     data = data.to(device)
 
@@ -898,20 +1220,41 @@ def train_and_evaluate(
     except Exception as _e:
         run_logger.warning(f"No se pudieron guardar algunos artefactos: {_e}")
 
-    # --- Evaluación sobre subconjuntos de aristas ---
-    if eval_subsets:
-        run_logger.info("Evaluando sobre %d subconjunto(s)...", len(eval_subsets))
-        for subset_name, filter_csv_path in eval_subsets.items():
-            filter_path = Path(filter_csv_path)
-            if not filter_path.exists():
-                run_logger.warning(
-                    "Subset '%s': CSV filtro no encontrado en %s — omitido", subset_name, filter_path
-                )
-                continue
+    # --- Evaluación sobre master_segments ---
+    if evaluate:
+        _default_master  = PROJECT_ROOT / "src" / "topsegments" / "master_segments.csv"
+        # _default_straight = PROJECT_ROOT / "src" / "outputs" / "routes" / "straight_routes.csv"
+        _master_path  = Path(master_csv)  if master_csv  is not None else _default_master
+        # _straight_path = Path(straight_csv) if straight_csv is not None else _default_straight
+
+        # for _subset_name, _csv_path in (("straight", _straight_path)):
+        if _master_path.exists():
+            run_logger.info("Evaluando master CSV")
             evaluate_on_subset(
                 model, data, edge_graph_df, nodes_path,
-                filter_path, subset_name, run_dir, device,
+                _master_path, "straight", run_dir, device,
             )
+        else:
+            run_logger.info(
+                "CSV straight no encontrado en %s — omitido", _master_path,
+            )
+
+    # --- Plots de entrenamiento ---
+    run_logger.info("Generando plots de entrenamiento...")
+    plot_training_results(
+        run_dir=run_dir,
+        history=train_info,
+        test_preds=test_preds,
+        test_targets=test_targets,
+        model_name=config.model,
+    )
+
+    # --- Evaluación de escenarios A/B/C derivados de eval_master ---
+    run_logger.info("Evaluando escenarios A/B/C desde eval_master...")
+    scenario_results = evaluate_scenarios_from_master(
+        run_dir=run_dir,
+        straightness_threshold=config.straightness_threshold,
+    )
 
     return {
         "model": config.model,
@@ -923,4 +1266,5 @@ def train_and_evaluate(
         "train_info": train_info,
         "final_metrics": final_metrics,
         "stats": stats,
+        "scenario_results": scenario_results,
     }

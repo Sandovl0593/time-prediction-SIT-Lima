@@ -7,10 +7,10 @@ Estructura de directorios esperada (outputs de trainer.py):
     src/outputs/training/<model>/<timestamp>/
         final_metrics.json          — métricas generales sobre test split
         test_predictions.csv        — edge_idx, pred, target
-        eval_config_A/
-            metrics.json            — métricas sobre test ∩ config_A
-            predictions.csv         — edge_idx, ..., pred, target, straightness_index
-        eval_config_B/  eval_config_C/  eval_straight/  (misma estructura)
+        eval_master/
+            metrics.json            — métricas sobre test ∩ master_segments
+            predictions.csv         — edge_idx, u, v, pred, target, tol_prox, km_offset, ...
+        eval_straight/              (misma estructura)
 
 Artefacto de salida:
     src/outputs/reports/tex_data.json
@@ -26,7 +26,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from src.config import ROUTE_CONFIGS
+from src.config import KM_BINS, IDEAL_CURVE_PENALTY, IDEAL_KM_TOLERANCE
 
 _TRAINING_BASE = Path("src") / "outputs" / "training"
 _REPORTS_DIR = Path("src") / "outputs" / "reports"
@@ -127,38 +127,53 @@ def build_config_comparison_table(
     model: str = "gatv2",
     base_dir: Optional[Path] = None,
 ) -> List[Dict]:
-    """tab:metricas_configs — GATv2 evaluado sobre subconjuntos config_A/B/C.
+    """tab:metricas_configs — encoder evaluado sobre eval_master agrupado por tol_prox.
+
+    Carga las predicciones de eval_master/predictions.csv y agrupa por bin de
+    tol_prox (km), calculando RMSE, MAE y R² por cada bin. Esta tabla reemplaza
+    la comparación artificial A/B/C por agrupación metodológica por kilometraje.
 
     Returns:
-        List de dicts: [{config, km_tol, curve_penalty, n_eval, rmse, mae, r2}, ...]
+        List de dicts: [{tol_prox_km, n_eval, rmse, mae, mape, r2}, ...]
     """
     base_dir = Path(base_dir) if base_dir is not None else _TRAINING_BASE
     run_dir = discover_latest_run(base_dir, model)
     rows = []
-    for letter in ("A", "B", "C"):
-        cfg_params = ROUTE_CONFIGS.get(letter, {})
-        entry: Dict = {
-            "config":        letter,
-            "km_tol":        cfg_params.get("km_tolerance", float("nan")),
-            "curve_penalty": cfg_params.get("curve_penalty", float("nan")),
-        }
-        if run_dir is None:
-            entry["error"] = "run_not_found"
-            rows.append(entry)
+
+    if run_dir is None:
+        return [{"error": "run_not_found", "model": model}]
+
+    preds_df = load_subset_predictions(run_dir, "master")
+    if preds_df is None:
+        return [{"error": "eval_master_not_found_or_skipped", "model": model}]
+
+    preds_df = preds_df.dropna(subset=["pred", "target"])
+    if "tol_prox" not in preds_df.columns:
+        return [{"error": "tol_prox_column_missing", "model": model}]
+
+    for km_bin in KM_BINS:
+        sub = preds_df[preds_df["tol_prox"] == km_bin]
+        if sub.empty:
             continue
-        m = load_subset_metrics(run_dir, f"config_{letter}")
-        if m is None:
-            entry["error"] = "eval_not_found_or_skipped"
-            rows.append(entry)
-            continue
-        entry.update({
-            "n_eval": int(m.get("n_eval", 0)),
-            "rmse":   round(float(m.get("rmse", float("nan"))), 4),
-            "mae":    round(float(m.get("mae",  float("nan"))), 4),
-            "mape":   round(float(m.get("mape", float("nan"))), 4),
-            "r2":     round(float(m.get("r2",   float("nan"))), 4),
+        residuals = (sub["pred"].values - sub["target"].values) ** 2
+        rmse = float(np.sqrt(residuals.mean()))
+        mae  = float(np.abs(sub["pred"].values - sub["target"].values).mean())
+        ss_res = residuals.sum()
+        ss_tot = ((sub["target"].values - sub["target"].values.mean()) ** 2).sum()
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        # MAPE: ignorar targets cero
+        tgt = sub["target"].values
+        prd = sub["pred"].values
+        nonzero = tgt != 0
+        mape = float(np.abs((prd[nonzero] - tgt[nonzero]) / tgt[nonzero]).mean() * 100) if nonzero.any() else float("nan")
+        rows.append({
+            "tol_prox_km": km_bin,
+            "n_eval":      len(sub),
+            "rmse":        round(rmse, 4),
+            "mae":         round(mae,  4),
+            "mape":        round(mape, 4),
+            "r2":          round(r2,   4),
         })
-        rows.append(entry)
     return rows
 
 
@@ -197,10 +212,9 @@ def build_encoder_comparison_straight(
 
 
 def build_straightness_breakdown_table(
-    config_letter: str = "B",
     base_dir: Optional[Path] = None,
 ) -> List[Dict]:
-    """tab:rmse_por_penalidad — RMSE por rango de r para los 3 encoders en config_X.
+    """tab:rmse_por_penalidad — RMSE por rango de r para los 3 encoders en eval_master.
 
     r = 1 / straightness_index  (r=1 = perfectamente recto, r>1 = más curvo)
 
@@ -210,7 +224,7 @@ def build_straightness_breakdown_table(
         List de dicts: [{r_range, r_min, r_max, n, rmse_graphsage, rmse_gat, rmse_gatv2}, ...]
     """
     base_dir = Path(base_dir) if base_dir is not None else _TRAINING_BASE
-    subset_name = f"config_{config_letter}"
+    subset_name = "master"
 
     # Cargar predicciones de los 3 encoders
     model_dfs: Dict[str, Optional[pd.DataFrame]] = {}
@@ -251,18 +265,17 @@ def build_straightness_breakdown_table(
 
 
 def build_rmse_vs_r_data(
-    config_letter: str = "B",
     r_step: float = 0.02,
     base_dir: Optional[Path] = None,
 ) -> List[Dict]:
-    """fig:rmse_vs_r — RMSE vs r en buckets finos para los 3 encoders en config_X.
+    """fig:rmse_vs_r — RMSE vs r en buckets finos para los 3 encoders en eval_master.
 
     Returns:
         List de dicts: [{r_center, n, rmse_graphsage, rmse_gat, rmse_gatv2}, ...]
         ordenados por r_center ascendente.
     """
     base_dir = Path(base_dir) if base_dir is not None else _TRAINING_BASE
-    subset_name = f"config_{config_letter}"
+    subset_name = "master"
 
     model_dfs: Dict[str, Optional[pd.DataFrame]] = {}
     for model in _MODELS_ORDERED:
@@ -319,13 +332,13 @@ def generate_tex_data_report(
     """Genera src/outputs/reports/tex_data.json con todos los datos para el LaTeX.
 
     Claves del JSON:
-        generated_at                 — timestamp ISO
-        config_params                — ROUTE_CONFIGS A/B/C
-        encoder_comparison_general   — tabla tab:metricas_general
-        config_comparison_gatv2      — tabla tab:metricas_configs
-        encoder_comparison_straight  — tabla tab:metricas_rectas
-        straightness_breakdown_B     — tabla tab:rmse_por_penalidad (config B)
-        rmse_vs_r_B                  — datos para fig:rmse_vs_r (config B)
+        generated_at                   — timestamp ISO
+        ideal_params                   — IDEAL_CURVE_PENALTY, IDEAL_KM_TOLERANCE
+        encoder_comparison_general     — tabla tab:metricas_general
+        config_comparison_gatv2        — tabla tab:metricas_configs (por tol_prox bin)
+        encoder_comparison_straight    — tabla tab:metricas_rectas
+        straightness_breakdown_master  — tabla tab:rmse_por_penalidad (eval_master)
+        rmse_vs_r_master               — datos para fig:rmse_vs_r (eval_master)
 
     Returns:
         Path al archivo JSON generado.
@@ -338,15 +351,15 @@ def generate_tex_data_report(
 
     report = {
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        "config_params": {
-            letter: dict(params)
-            for letter, params in ROUTE_CONFIGS.items()
+        "ideal_params": {
+            "curve_penalty": IDEAL_CURVE_PENALTY,
+            "km_tolerance":  IDEAL_KM_TOLERANCE,
         },
         "encoder_comparison_general":  build_encoder_comparison_table(base_dir),
         "config_comparison_gatv2":     build_config_comparison_table("gatv2", base_dir),
         "encoder_comparison_straight": build_encoder_comparison_straight(base_dir),
-        "straightness_breakdown_B":    build_straightness_breakdown_table("B", base_dir),
-        "rmse_vs_r_B":                 build_rmse_vs_r_data("B", base_dir=base_dir),
+        "straightness_breakdown_master": build_straightness_breakdown_table(base_dir),
+        "rmse_vs_r_master":              build_rmse_vs_r_data(base_dir=base_dir),
     }
 
     with open(output_path, "w", encoding="utf-8") as fh:

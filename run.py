@@ -31,7 +31,7 @@ def parse_args():
         choices=Config.VALID_MODELS,
         help="Modelo a entrenar",
     )
-    parser.add_argument("--process-nyc", action="store_true", help="Procesar datos RAW de NYC y guardar en processed/")
+    parser.add_argument("-p", "--process-nyc", action="store_true", help="Procesar datos RAW de NYC y guardar en processed/")
     parser.add_argument("-s", "--show-processed", action="store_true", help="Cargar y mostrar visualización desde src/data/processed/graph sin parámetros")
     parser.add_argument("--cleaning-config", type=str, default=None, help="Ruta a JSON con umbrales/configuración de limpieza")
     parser.add_argument("--clean-outputs", action="store_true", help="Eliminar la carpeta src/outputs (limpieza de artefactos) antes de ejecutar")
@@ -97,40 +97,10 @@ def main():
 
         # Process the model training and evaluation if not in a special mode
         if not (args.process_nyc or args.view_file or args.show_processed):
-            # Resolver subconjuntos de evaluación
-            _SUBSET_CSVS = {
-                "config_A": os.path.join("src", "topsegments", "config_A.csv"),
-                "config_B": os.path.join("src", "topsegments", "config_B.csv"),
-                "config_C": os.path.join("src", "topsegments", "config_C.csv"),
-                "straight": os.path.join("src", "outputs", "routes", "straight_routes.csv"),
-            }
-            if args.eval_subsets is None:
-                # Por defecto: incluir todos los subsets cuyos CSVs existan
-                eval_subsets = {
-                    name: path
-                    for name, path in _SUBSET_CSVS.items()
-                    if os.path.exists(path)
-                }
-            elif len(args.eval_subsets) == 0:
-                # --eval-subsets sin argumentos: mismo comportamiento que default
-                eval_subsets = {
-                    name: path
-                    for name, path in _SUBSET_CSVS.items()
-                    if os.path.exists(path)
-                }
-            else:
-                eval_subsets = {
-                    name: _SUBSET_CSVS[name]
-                    for name in args.eval_subsets
-                    if name in _SUBSET_CSVS
-                }
-                unknown = [s for s in args.eval_subsets if s not in _SUBSET_CSVS]
-                if unknown:
-                    print(f"[run.py] Warning: subsets desconocidos ignorados: {unknown}")
-
-            if eval_subsets:
-                print(f"[run.py] Subsets de evaluación: {list(eval_subsets.keys())}")
-            train_and_evaluate(config, eval_subsets=eval_subsets or None)
+            # master_segments.csv y straight_routes.csv se buscan en las rutas
+            # por defecto; si no existen, train_and_evaluate los omite sin error.
+            # Los escenarios A/B/C se derivan automáticamente de eval_master.
+            train_and_evaluate(config)
 
     # Si se solicita procesar los datos raw de NYC, ejecutar el pipeline
     if args.process_nyc:

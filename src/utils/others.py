@@ -34,6 +34,9 @@ def get_logger(name: str = "project", log_file: Optional[str] = None) -> logging
         handler = logging.StreamHandler()
         handler.setFormatter(fmt)
         logger.addHandler(handler)
+    # Fijar nivel solo si no fue establecido explícitamente (evita sobreescribir
+    # configuraciones hechas desde fuera, pero garantiza que el logger responda).
+    if logger.level == logging.NOTSET:
         logger.setLevel(logging.INFO)
     if log_file is not None:
         log_path = Path(log_file)

@@ -1,35 +1,26 @@
-"""Export de segmentos filtrados por configuración (A / B / C).
+"""Export del CSV maestro de segmentos filtrados con parámetros ideales.
 
 Input : src/outputs/routes/straight_routes.csv
         (rutas ya filtradas por índice de rectitud ≥ straightness_threshold)
 
-Output: src/topsegments/config_A.csv
-        src/topsegments/config_B.csv
-        src/topsegments/config_C.csv
+Output: src/topsegments/master_segments.csv
+        src/topsegments/config_export_summary.json
 
 Criterio de selección (búsqueda sin límite de cantidad):
 ---------------------------------------------------------
-Para cada configuración X con parámetros (km_tolerance, curve_penalty):
+Parámetros únicos e ideales (IDEAL_CURVE_PENALTY, IDEAL_KM_TOLERANCE):
 
   1. km_filter:
-         abs(km_offset) / (tol_prox + ε) ≤ km_tolerance
+         abs(km_offset) / (tol_prox + ε) ≤ IDEAL_KM_TOLERANCE
 
   2. score_filter:
          config_score ≥ score_threshold
          donde:
-           config_score    = straightness_index − curve_penalty · |km_offset| / (tol_prox + ε)
-           score_threshold = straightness_threshold − curve_penalty · km_tolerance
+           config_score    = straightness_index − IDEAL_CURVE_PENALTY · |km_offset| / (tol_prox + ε)
+           score_threshold = straightness_threshold − IDEAL_CURVE_PENALTY · IDEAL_KM_TOLERANCE
 
-     La score_threshold representa el mínimo esperable para un segmento
-     perfectamente recto (straightness_index = straightness_threshold) que
-     se encuentra exactamente en el borde de la tolerancia km.
-
-Rangos de parámetros (definidos en config.CURVE_PENALTY_RANGE / KM_TOLERANCE_RANGE):
-  curve_penalty  : 0.5 (ideal, penaliza fuertemente curvas) → 0.1 (peor caso realista)
-  km_tolerance   : 0.2 (ideal, ±20% del bin)               → 0.5 (peor caso realista, ±50%)
-
-Las configuraciones A/B/C están dentro de ese rango; cuanto más estricta
-la config, menor será el conjunto de candidatos pero de mayor calidad.
+No se utilizan configuraciones experimentales múltiples (A/B/C).
+La agrupación posterior se realiza por tol_prox y km_offset derivados del CSV maestro.
 """
 
 from __future__ import annotations
@@ -40,7 +31,7 @@ from typing import Dict, Optional
 
 import pandas as pd
 
-from src.config import ROUTE_CONFIGS, Config
+from src.config import IDEAL_CURVE_PENALTY, IDEAL_KM_TOLERANCE, Config
 
 _STRAIGHT_CSV_DEFAULT = Path("src") / "outputs" / "routes" / "straight_routes.csv"
 _TOPSEGMENTS_DIR = Path("src") / "topsegments"
@@ -95,26 +86,28 @@ def filter_segments_for_config(
     return result.sort_values("config_score", ascending=False).reset_index(drop=True)
 
 
-def export_segments_by_config(
+def export_master_segments(
     straight_csv: Optional[Path] = None,
     output_dir: Optional[Path] = None,
-    route_configs: Optional[Dict] = None,
+    curve_penalty: float = IDEAL_CURVE_PENALTY,
+    km_tolerance: float = IDEAL_KM_TOLERANCE,
     straightness_threshold: Optional[float] = None,
 ) -> Dict[str, str]:
-    """Exporta segmentos filtrados para cada configuración (A, B, C).
+    """Exporta el CSV maestro de segmentos filtrados con parámetros ideales.
 
-    Lee straight_routes.csv, aplica los filtros de cada config y escribe:
-        src/topsegments/config_A.csv
-        src/topsegments/config_B.csv
-        src/topsegments/config_C.csv
+    Lee straight_routes.csv, aplica los filtros con IDEAL_CURVE_PENALTY e
+    IDEAL_KM_TOLERANCE y escribe un único CSV maestro:
+        src/topsegments/master_segments.csv
         src/topsegments/config_export_summary.json
 
+    Toda agrupación posterior (por tol_prox, km_offset) debe derivarse
+    de este CSV maestro en lugar de reconstruir configuraciones artificiales.
+
     Returns:
-        Diccionario {config_X: path_csv, config_export_summary: path_json}.
+        Diccionario {master_segments: path_csv, config_export_summary: path_json}.
     """
     src_path = Path(straight_csv) if straight_csv is not None else _STRAIGHT_CSV_DEFAULT
     out_dir = Path(output_dir) if output_dir is not None else _TOPSEGMENTS_DIR
-    configs = route_configs if route_configs is not None else ROUTE_CONFIGS
     s_threshold = (
         straightness_threshold
         if straightness_threshold is not None
@@ -130,43 +123,39 @@ def export_segments_by_config(
     out_dir.mkdir(parents=True, exist_ok=True)
     df_straight = pd.read_csv(src_path)
 
-    artifacts: Dict[str, str] = {}
-    summary: Dict[str, dict] = {}
+    thresh = _score_threshold(s_threshold, curve_penalty, km_tolerance)
+    df_master = filter_segments_for_config(
+        df_straight,
+        km_tolerance=km_tolerance,
+        curve_penalty=curve_penalty,
+        straightness_threshold=s_threshold,
+    )
 
-    for letter, params in configs.items():
-        km_tol = float(params["km_tolerance"])
-        pen = float(params["curve_penalty"])
-        thresh = _score_threshold(s_threshold, pen, km_tol)
+    out_path = out_dir / "master_segments.csv"
+    df_master.to_csv(out_path, index=False)
 
-        df_filtered = filter_segments_for_config(
-            df_straight,
-            km_tolerance=km_tol,
-            curve_penalty=pen,
-            straightness_threshold=s_threshold,
-        )
-
-        out_path = out_dir / f"config_{letter}.csv"
-        df_filtered.to_csv(out_path, index=False)
-        artifacts[f"config_{letter}"] = str(out_path)
-
-        summary[letter] = {
-            "km_tolerance": km_tol,
-            "curve_penalty": pen,
+    summary = {
+        "master": {
+            "km_tolerance": km_tolerance,
+            "curve_penalty": curve_penalty,
             "score_threshold": thresh,
             "total_straight_in": len(df_straight),
-            "segments_exported": len(df_filtered),
+            "segments_exported": len(df_master),
             "mean_config_score": (
-                float(df_filtered["config_score"].mean()) if not df_filtered.empty else None
+                float(df_master["config_score"].mean()) if not df_master.empty else None
             ),
             "mean_straightness_index": (
-                float(df_filtered["straightness_index"].mean()) if not df_filtered.empty else None
+                float(df_master["straightness_index"].mean()) if not df_master.empty else None
             ),
             "out_path": str(out_path),
         }
+    }
 
     summary_path = out_dir / "config_export_summary.json"
     with open(summary_path, "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False, default=str)
-    artifacts["config_export_summary"] = str(summary_path)
 
-    return artifacts
+    return {
+        "master_segments": str(out_path),
+        "config_export_summary": str(summary_path),
+    }
