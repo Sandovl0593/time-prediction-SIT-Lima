@@ -29,27 +29,6 @@ STRAIGHT_THRESHOLD: float = 0.9  # índice de rectitud mínimo para rutas rectas
 
 @dataclass
 class Config:
-    """Configuración central del experimento.
-
-    Attributes:
-        model: Nombre del modelo a entrenar.
-            Opciones: 'gat', 'gatv2', 'graphsage'
-        hidden_dim: Dimensión de las capas ocultas.
-        num_layers: Número de capas del encoder de grafos.
-        heads: Número de heads de atención (solo para GAT/GATv2).
-        gru_hidden_dim: Dimensión oculta del GRU (solo para modelos híbridos).
-        gru_num_layers: Número de capas GRU (solo para modelos híbridos).
-        dropout: Tasa de dropout.
-        lr: Learning rate.
-        weight_decay: Regularización L2.
-        epochs: Número de épocas de entrenamiento.
-        seed: Semilla para reproducibilidad.
-        test_ratio: Proporción de aristas para test.
-        num_time_steps: Pasos temporales para modelos híbridos (GRU).
-        device: Dispositivo de cómputo ('cpu' o 'cuda').
-        straightness_threshold: Umbral mínimo de índice de rectitud para seleccionar rutas rectas.
-    """
-
     # ---------- Paths ----------
     data_dir = Path("src/data/processed")
     graph_dir = data_dir / "graph"
@@ -58,10 +37,11 @@ class Config:
 
     # ---------- Model ----------
     model: str = "gatv2"      # graphsage | gat | gatv2
-    hidden_dim: int = 64
-    num_layers: int = 2
+    # hidden_dim: int = 128
+    hidden_dim: int = 128
+    num_layers: int = 3
     heads: int = 4
-    dropout: float = 0.2
+    dropout: float = 0.3
     # ---------- Training ----------
     epochs: int = 200
     learning_rate: float = 1e-3
@@ -74,12 +54,13 @@ class Config:
     seed: int = 42
 
     # ---------- Early stopping ----------
-    patience: int = 25
+    # patience: int = 25
+    patience: int = 20
     # ---------- Logs ----------
     eval_every: int = 5
     print_every: int = 1
 
-    device: str = "cuda"
+    device: str = "cpu"
 
     VALID_MODELS = (
         "graphsage",

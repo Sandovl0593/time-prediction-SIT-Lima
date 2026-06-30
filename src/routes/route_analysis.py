@@ -99,45 +99,6 @@ def build_routes_distribution(df: pd.DataFrame) -> pd.DataFrame:
     return dist
 
 
-def build_straight_routes(
-    df: pd.DataFrame,
-    straightness_threshold: Optional[float] = None,
-) -> pd.DataFrame:
-    """Filtra rutas rectas o casi rectas según el umbral de rectitud.
-
-    Args:
-        df: DataFrame del CSV maestro.
-        straightness_threshold: Umbral mínimo de straightness_index.
-            Si es None, usa Config.straightness_threshold (0.9 por defecto).
-    """
-    threshold = (
-        straightness_threshold
-        if straightness_threshold is not None
-        else Config().straightness_threshold
-    )
-    mask = df["straightness_index"].notna() & (df["straightness_index"] >= threshold)
-    return df[mask].copy()
-
-
-def build_straight_routes_by_config(
-    df_straight: pd.DataFrame,
-) -> dict:
-    """Genera un diccionario con recuento de rutas rectas por escenario."""
-    if df_straight.empty or "scenario_id" not in df_straight.columns:
-        return {}
-    counts = (
-        df_straight.groupby("scenario_id")
-        .agg(
-            straight_count=("score", "count"),
-            mean_score=("score", "mean"),
-            mean_straightness_index=("straightness_index", "mean"),
-        )
-        .reset_index()
-        .to_dict(orient="records")
-    )
-    return {rec["scenario_id"]: rec for rec in counts}
-
-
 def run_route_analysis(
     master_csv: Optional[Path] = None,
     output_dir: Optional[Path] = None
@@ -178,29 +139,6 @@ def run_route_analysis(
     dist_path = out_dir / "routes_distribution.csv"
     distribution.to_csv(dist_path, index=False)
     artifacts["routes_distribution"] = str(dist_path)
-
-    # straight_routes.csv
-    straight = build_straight_routes(df, straightness_threshold=STRAIGHT_THRESHOLD)
-    straight_path = out_dir / "straight_routes.csv"
-    straight.to_csv(straight_path, index=False)
-    artifacts["straight_routes"] = str(straight_path)
-
-    # straight_routes_by_config.json
-    by_config = build_straight_routes_by_config(straight)
-    by_config_path = out_dir / "straight_routes_by_config.json"
-    with open(by_config_path, "w", encoding="utf-8") as fh:
-        json.dump(by_config, fh, indent=2, ensure_ascii=False, default=str)
-    artifacts["straight_routes_by_config"] = str(by_config_path)
-
-    # master_segments.csv — CSV maestro con parámetros ideales únicos
-    try:
-        master_artifacts = export_master_segments(
-            straight_csv=straight_path,
-            straightness_threshold=STRAIGHT_THRESHOLD,
-        )
-        artifacts.update(master_artifacts)
-    except Exception as e:
-        artifacts["master_export_error"] = str(e)
 
     return artifacts
 

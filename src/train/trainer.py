@@ -397,7 +397,7 @@ def _load_processed_graph_as_pyg(
 
     x = torch.tensor(node_feature_df.to_numpy(dtype=np.float32), dtype=torch.float)
     edge_attr = torch.tensor(edge_feature_df.to_numpy(dtype=np.float32), dtype=torch.float)
-    
+
     # Aclaración sobre target: NaN para aristas sin observación (no cero, que es un valor físico válido).
     y_norm = np.full(len(y_raw), np.nan, dtype=np.float32)
     scaler = StandardScaler()
@@ -456,252 +456,296 @@ def _load_processed_graph_as_pyg(
 
     return data, metadata, edge_graph_df
 
-
-def _build_subset_mask(
-    edge_graph_df: pd.DataFrame,
-    nodes_path: Path,
-    filter_csv_path: Path,
-) -> Tuple[torch.Tensor, pd.DataFrame]:
-    """Construye máscara booleana para aristas que aparecen en filter_csv.
-
-    Estrategia de matching:
-    1. Carga filter_csv y lee start_stop_id/end_stop_id (GTFS IDs reales).
-    2. Cruza directamente contra (u, v) en edge_graph_df — sin conversión de
-       índices posicionales, porque route_candidates.csv ya emite IDs reales.
-
-    Desambiguación de aristas paralelas:
-    Si un par (u, v) tiene tanto aristas espaciales como observadas, se
-    prefieren las observadas para no contaminar la evaluación. Si filter_csv
-    contiene una columna 'edge_key', se usa el triple (u, v, edge_key) para
-    matching exacto.
-
-    Returns:
-        in_subset : bool tensor de shape [len(edge_graph_df)]
-        meta_df   : DataFrame con metadata de ruta para las aristas matched
-    """
-    n = len(edge_graph_df)
-    empty_meta = pd.DataFrame()
-
-    try:
-        filter_df = pd.read_csv(str(filter_csv_path), low_memory=False)
-    except Exception as exc:
-        logger.warning("_build_subset_mask: no se pudo leer %s — %s", filter_csv_path, exc)
-        return torch.zeros(n, dtype=torch.bool), empty_meta
-
-    # Determinar columnas de ID de nodo
-    # Soporte para CSVs nuevos (start_stop_id/end_stop_id) y legacy (start_idx/end_idx + nodes.csv)
-    has_stop_ids = "start_stop_id" in filter_df.columns and "end_stop_id" in filter_df.columns
-
-    if has_stop_ids:
-        filter_df["_u_str"] = filter_df["start_stop_id"].astype(str)
-        filter_df["_v_str"] = filter_df["end_stop_id"].astype(str)
-    else:
-        # Fallback legacy: convertir start_idx/end_idx mediante nodes.csv
-        logger.warning(
-            "_build_subset_mask: filter_csv no contiene start_stop_id/end_stop_id; "
-            "usando fallback legacy con nodes.csv. Regenera route_candidates.csv para evitar esto."
-        )
-        try:
-            nodes_df = _safe_read_csv(nodes_path)
-            node_ids: list = nodes_df["GTFS Stop ID"].astype(str).tolist()
-        except Exception as exc:
-            logger.warning("_build_subset_mask: no se pudo leer nodes.csv — %s", exc)
-            return torch.zeros(n, dtype=torch.bool), empty_meta
-
-        # Filtro legacy: solo retener rutas 1-hop (geometry_wkt de exactamente 2 puntos)
-        if "geometry_wkt" in filter_df.columns:
-            from shapely import wkt as _wkt
-            def _is_direct(wkt_str: str) -> bool:
-                if not isinstance(wkt_str, str) or not wkt_str.strip():
-                    return False
-                try:
-                    return len(list(_wkt.loads(wkt_str).coords)) == 2
-                except Exception:
-                    return False
-            filter_df = filter_df[filter_df["geometry_wkt"].apply(_is_direct)].copy()
-
-        if filter_df.empty:
-            logger.warning(
-                "_build_subset_mask: ninguna ruta directa (1-hop) encontrada en %s", filter_csv_path
-            )
-            return torch.zeros(n, dtype=torch.bool), empty_meta
-
-        def _idx_to_gtfs(idx) -> str:
-            try:
-                i = int(idx)
-                if 0 <= i < len(node_ids):
-                    return node_ids[i]
-            except (ValueError, TypeError):
-                pass
-            return str(idx)
-
-        filter_df["_u_str"] = filter_df["start_idx"].apply(_idx_to_gtfs)
-        filter_df["_v_str"] = filter_df["end_idx"].apply(_idx_to_gtfs)
-
-    if filter_df.empty:
-        logger.warning("_build_subset_mask: filter_csv vacío tras preprocesado — %s", filter_csv_path)
-        return torch.zeros(n, dtype=torch.bool), empty_meta
-
-    filter_pairs: set = set(zip(filter_df["_u_str"], filter_df["_v_str"]))
-
-    # Matching exacto por triple (u, v, edge_key) si está disponible
-    use_edge_key = "edge_key" in filter_df.columns
-    if use_edge_key:
-        filter_triples: set = set(zip(
-            filter_df["_u_str"], filter_df["_v_str"], filter_df["edge_key"].astype(str)
-        ))
-
-    # Lookup de metadata por par (u, v) — primer match gana
-    meta_cols = ["_u_str", "_v_str"] + [
-        c for c in ("straightness_index", "tol_prox", "km_offset", "line", "score", "config_score")
-        if c in filter_df.columns
-    ]
-    meta_lookup: dict = {}
-    for _, row in filter_df[meta_cols].iterrows():
-        pair_uv = (row["_u_str"], row["_v_str"])
-        if pair_uv not in meta_lookup:
-            meta_lookup[pair_uv] = {k: v for k, v in row.items() if k not in ("_u_str", "_v_str")}
-
-    # Desambiguación de aristas paralelas: preferir is_observed=1
-    has_is_observed = "is_observed" in edge_graph_df.columns
-    if has_is_observed:
-        observed_pairs: set = set(
-            (str(r["u"]), str(r["v"]))
-            for _, r in edge_graph_df.iterrows()
-            if float(r.get("is_observed", 0)) == 1.0
-            and (str(r["u"]), str(r["v"])) in filter_pairs
-        )
-    else:
-        observed_pairs = set()
-
-    in_subset_list: list = []
-    meta_rows: list = []
-    for pos_idx, row in edge_graph_df.iterrows():
-        u_str = str(row["u"])
-        v_str = str(row["v"])
-        pair_uv = (u_str, v_str)
-
-        if use_edge_key:
-            edge_key_str = str(row.get("key", ""))
-            matched = (u_str, v_str, edge_key_str) in filter_triples
-        elif pair_uv in filter_pairs:
-            if observed_pairs and pair_uv in observed_pairs:
-                is_obs = has_is_observed and float(row.get("is_observed", 0)) == 1.0
-                matched = is_obs
-            else:
-                matched = True
-        else:
-            matched = False
-
-        in_subset_list.append(matched)
-        if matched:
-            meta = {"edge_pos_idx": pos_idx, "u": u_str, "v": v_str}
-            meta.update(meta_lookup.get(pair_uv, {}))
-            meta_rows.append(meta)
-
-    in_subset_tensor = torch.tensor(in_subset_list, dtype=torch.bool)
-    meta_df = pd.DataFrame(meta_rows) if meta_rows else empty_meta
-    return in_subset_tensor, meta_df
-
-
-def evaluate_on_subset(
+def predict_routes(
     model: nn.Module,
     data: Data,
     edge_graph_df: pd.DataFrame,
-    nodes_path: Path,
-    filter_csv_path: Path,
-    subset_name: str,
+    route_candidates_csv: Path,
     run_dir: Path,
     device: torch.device,
-) -> Optional[Dict[str, object]]:
-    """Evalúa el modelo entrenado sobre test_mask ∩ labeled_mask ∩ in_subset.
+    straightness_threshold: float = STRAIGHT_THRESHOLD,
+) -> Dict[str, object]:
+    """Predice tiempos de viaje para rutas multi-hop desde route_candidates.csv.
 
-    Guarda:
-        run_dir/eval_{subset_name}/metrics.json
-        run_dir/eval_{subset_name}/predictions.csv
+    Flujo por ruta en route_candidates.csv:
+        1. Si la ruta es 1-hop (columnas start_stop_id/end_stop_id definen
+           directamente una arista), se busca su posición en edge_graph_df.
+        2. Si la ruta es multi-hop (columna 'hops' con lista de stop IDs
+           intermedios), se descompone en hops elementales y se suma.
+        3. Si algún hop no está en el grafo, la ruta se marca como no-cobertura
+           y queda con pred_time=NaN.
+
+    Después de predecir todas las rutas, aplica los filtros de escenarios A/B/C
+    (km_tolerance + curve_penalty sobre straightness_index y km_offset) y guarda:
+        run_dir/route_predictions/all_routes.csv
+        run_dir/route_predictions/scenario_A.csv
+        run_dir/route_predictions/scenario_B.csv
+        run_dir/route_predictions/scenario_C.csv
+        run_dir/route_predictions/summary.json
 
     Returns:
-        Dict con las métricas, o None si no hay aristas de evaluación.
+        Dict con conteos y rutas de archivos generados.
     """
     import json as _json
 
-    out_dir = run_dir / f"eval_{subset_name}"
+    out_dir = run_dir / "route_predictions"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # ------------------------------------------------------------------ #
+    # 1. Cargar route_candidates y obtener todas las predicciones del modelo
+    # ------------------------------------------------------------------ #
     try:
-        in_subset, meta_df = _build_subset_mask(edge_graph_df, nodes_path, filter_csv_path)
+        cand_df = pd.read_csv(str(route_candidates_csv), low_memory=False)
     except Exception as exc:
-        logger.warning("evaluate_on_subset [%s]: error al construir máscara — %s", subset_name, exc)
-        with open(out_dir / "metrics.json", "w", encoding="utf-8") as fh:
-            _json.dump({"subset_name": subset_name, "n_eval": 0, "skipped": True, "error": str(exc)}, fh, indent=2)
-        return None
+        logger.warning("predict_routes: no se pudo leer %s — %s", route_candidates_csv, exc)
+        return {"error": str(exc)}
 
-    in_subset = in_subset.to(device)
-    # labeled_mask: aristas con target no-NaN (re-verificación explícita)
-    labeled_mask = ~torch.isnan(data.y)
-    eval_mask = data.test_mask & labeled_mask & in_subset
-    n_eval = int(eval_mask.sum().item())
+    if cand_df.empty:
+        logger.warning("predict_routes: route_candidates.csv está vacío")
+        return {"n_routes": 0}
 
-    if n_eval == 0:
-        logger.warning(
-            "evaluate_on_subset [%s]: ninguna arista de test coincide con el subconjunto", subset_name
-        )
-        with open(out_dir / "metrics.json", "w", encoding="utf-8") as fh:
-            _json.dump({"subset_name": subset_name, "n_eval": 0, "skipped": True}, fh, indent=2)
-        return None
-
+    # Obtener predicciones del modelo para TODAS las aristas del grafo
     model.eval()
     with torch.no_grad():
-        all_preds = model(data.x, data.edge_index, data.edge_attr).squeeze(-1)
+        all_preds_norm = model(
+            data.x.to(device),
+            data.edge_index.to(device),
+            data.edge_attr.to(device),
+        ).squeeze(-1).detach().cpu()
 
-    subset_preds = all_preds[eval_mask].detach().cpu().numpy()
-    subset_targets = data.y[eval_mask].detach().cpu().numpy()
+    y_raw = data.y.to(device)
+    # Desnormalizar si hay scaler disponible en data
+    scaler = getattr(data, "target_scaler", None)
+    if scaler is not None:
+        all_preds_sec = scaler.inverse_transform(
+            all_preds_norm.numpy().reshape(-1, 1)
+        ).ravel()
+        y_denorm = scaler.inverse_transform(
+            y_raw.numpy().reshape(-1, 1)
+        ).ravel()
+    else:
+        all_preds_sec = all_preds_norm.numpy()
+        y_denorm = y_raw.numpy()
 
-    metrics = compute_all_metrics(subset_preds, subset_targets)
-    metrics_out: Dict[str, object] = {
-        "subset_name": subset_name,
-        "n_eval": n_eval,
-        **{k: float(v) for k, v in metrics.items()},
+    # ------------------------------------------------------------------ #
+    # 2. Construir lookup (u_str, v_str) → target_time y pred_time
+    #    Para aristas paralelas se promedia (misma pareja u,v en distinto key)
+    # ------------------------------------------------------------------ #
+    uv_to_preds: Dict[str, list] = {}
+    for pos_idx, row in edge_graph_df.iterrows():
+        key = str(row["u"]) + "__" + str(row["v"])
+        uv_to_preds.setdefault(key, []).append(float(all_preds_sec[pos_idx]))
+
+    uv_to_targets: Dict[str, list] = {}
+    for pos_idx, row in edge_graph_df.iterrows():
+        t_val = float(y_denorm[pos_idx])
+        if not np.isnan(t_val):
+            key = str(row["u"]) + "__" + str(row["v"])
+            uv_to_targets.setdefault(key, []).append(t_val)
+
+    # Para cada par (u,v), usar la predicción media entre aristas paralelas
+    uv_pred: Dict[str, float] = {
+        uv: float(np.mean(vals)) for uv, vals in uv_to_preds.items()
     }
-    with open(out_dir / "metrics.json", "w", encoding="utf-8") as fh:
-        _json.dump(metrics_out, fh, indent=2, ensure_ascii=False)
+    uv_target: Dict[str, float] = {
+        uv: float(np.mean(vals)) for uv, vals in uv_to_targets.items()
+    }
 
-    # Predictions CSV — enriquecido con metadata de ruta
-    eval_edge_indices = eval_mask.nonzero(as_tuple=False).squeeze(1).cpu().numpy()
-    pred_df = pd.DataFrame({
-        "edge_idx": eval_edge_indices,
-        "pred": subset_preds,
-        "target": subset_targets,
-    })
-    if not meta_df.empty and "edge_pos_idx" in meta_df.columns:
-        pred_df = pred_df.merge(
-            meta_df.rename(columns={"edge_pos_idx": "edge_idx"}),
-            on="edge_idx",
-            how="left",
-        )
-    pred_df.to_csv(out_dir / "predictions.csv", index=False)
+
+    # ------------------------------------------------------------------ #
+    # 3. Predecir cada ruta en route_candidates.csv
+    # ------------------------------------------------------------------ #
+    # Determinar si la ruta viene en formato 1-hop (start_stop_id/end_stop_id)
+    # o multi-hop (columna 'hops' con lista JSON de stop IDs consecutivos).
+    has_hops_col = "hops" in cand_df.columns
+    has_stop_ids = "start_stop_id" in cand_df.columns and "end_stop_id" in cand_df.columns
+
+    result_rows = []
+    n_covered = 0
+    n_missing_hop = 0
+
+    for _, cand_row in cand_df.iterrows():
+        # Construir lista de hops elementales para esta ruta
+        if has_hops_col and pd.notna(cand_row.get("hops", None)):
+            try:
+                hop_ids: list = _json.loads(str(cand_row["hops"]))
+                # hop_ids es lista de stop IDs: [A, B, C, D]
+                # → hops elementales: [(A,B), (B,C), (C,D)]
+                hop_pairs = [(str(hop_ids[k]), str(hop_ids[k + 1])) for k in range(len(hop_ids) - 1)]
+            except Exception:
+                hop_pairs = []
+        elif has_stop_ids:
+            u_str = str(cand_row["start_stop_id"])
+            v_str = str(cand_row["end_stop_id"])
+            hop_pairs = [(u_str, v_str)]
+        else:
+            hop_pairs = []
+
+        if not hop_pairs:
+            pred_time = float("nan")
+            covered = False
+        else:
+            hop_times = []
+            hop_targets = []
+            all_found = True
+            for u_str, v_str in hop_pairs:
+                uv = str(u_str) + "__" + str(v_str)
+                vu = str(v_str) + "__" + str(u_str)
+                t_pred = uv_pred.get(uv) or uv_pred.get(vu)
+                if t_pred is None:
+                    all_found = False
+                    break
+                hop_times.append(t_pred)
+                # target puede no existir (arista espacial sin observación) → None
+                t_tgt = uv_target.get(uv) or uv_target.get(vu)
+                hop_targets.append(t_tgt)
+
+            if all_found:
+                pred_time = float(np.sum(hop_times))
+                # target solo si todos los hops tienen ground truth
+                target_time = (
+                    float(np.sum(hop_targets))
+                    if all(t is not None for t in hop_targets)
+                    else float("nan")
+                )
+                covered = True
+            else:
+                pred_time = float("nan")
+                target_time = float("nan")
+                covered = False
+                n_missing_hop += 1
+
+        row_out = dict(cand_row)
+        row_out["pred"] = pred_time
+        row_out["target"] = target_time
+        row_out["has_target"] = not np.isnan(target_time) and not target_time == 0
+        row_out["n_hops"] = len(hop_pairs)
+        row_out["covered"] = covered
+        result_rows.append(row_out)
+
+    all_routes_df = pd.DataFrame(result_rows)
+    all_routes_df.to_csv(out_dir / "all_routes.csv", index=False)
 
     logger.info(
-        "Subset eval [%s] | n_eval: %d | RMSE: %.4f | R²: %.4f",
-        subset_name, n_eval,
-        metrics.get("rmse", float("nan")),
-        metrics.get("r2", float("nan")),
+        "predict_routes: %d rutas totales | %d cubiertas por el grafo | %d con hops faltantes",
+        len(all_routes_df), n_covered, n_missing_hop,
     )
-    return metrics_out
+
+    # ------------------------------------------------------------------ #
+    # 4. Aplicar escenarios A/B/C por km_tolerance + curve_penalty
+    # ------------------------------------------------------------------ #
+    scenario_results: Dict[str, object] = {}
+    bin_results: Dict[str, object] = {}
+
+    required_for_scenarios = {"straightness_index", "tol_prox", "km_offset"}
+    can_run_scenarios = required_for_scenarios.issubset(set(all_routes_df.columns))
+
+    covered_df = all_routes_df[all_routes_df["covered"]].copy()
+
+
+    for km_bin, bin_group in covered_df.groupby("tol_prox"):
+        bin_times = bin_group["pred"].dropna()
+        bin_results[str(km_bin)] = {
+            "n_routes": len(bin_group),
+            "mean_pred_sec": float(bin_times.mean()) if len(bin_times) else None,
+            "median_pred_sec": float(bin_times.median()) if len(bin_times) else None,
+            "std_pred_sec": float(bin_times.std()) if len(bin_times) else None,
+        }
+        bin_targets = bin_group["target"].dropna()
+        # errors
+        bin_metrics = compute_all_metrics(
+            bin_times.values,
+            bin_targets.values,
+        )
+        bin_results[str(km_bin)].update(
+            {k: float(v) for k, v in bin_metrics.items()}
+        )
+
+
+    for letter, params in EVAL_SCENARIOS.items():
+        km_tol    = float(params["km_tolerance"])
+        curve_pen = float(params["curve_penalty"])
+
+        if not can_run_scenarios or covered_df.empty:
+            logger.warning("predict_routes: no hay columnas para escenario %s o no hay rutas cubiertas", letter)
+            scenario_results[letter] = {"n_routes": 0, "skipped": True}
+            continue
+
+        _eps = 1e-9
+        scenario_score = (
+            covered_df["straightness_index"]
+            - curve_pen * covered_df["km_offset"].abs() / (covered_df["tol_prox"] + _eps)
+        )
+        score_threshold = straightness_threshold - curve_pen * km_tol
+        km_filter    = covered_df["km_offset"].abs() / (covered_df["tol_prox"] + _eps) <= km_tol
+        score_filter = scenario_score >= score_threshold
+
+        scen_df = covered_df[km_filter & score_filter].copy()
+        scen_df["scenario_score"] = scenario_score[km_filter & score_filter].values
+
+        # Agrupar por bin de km para ver distribución de predicciones
+        summary_by_bin: Dict[str, object] = {}
+        if "tol_prox" in scen_df.columns and not scen_df.empty:
+            for km_bin, bin_group in scen_df.groupby("tol_prox"):
+                bin_times = bin_group["pred"].dropna()
+                summary_by_bin[str(km_bin)] = {
+                    "n_routes": len(bin_group),
+                    "mean_pred_sec": float(bin_times.mean()) if len(bin_times) else None,
+                    "median_pred_sec": float(bin_times.median()) if len(bin_times) else None,
+                    "std_pred_sec": float(bin_times.std()) if len(bin_times) else None,
+                }
+                bin_targets = bin_group["target"].dropna()
+
+
+        scenario_results[letter] = {
+            "n_routes": len(scen_df),
+            "km_tolerance": km_tol,
+            "curve_penalty": curve_pen,
+            "score_threshold": score_threshold,
+            "by_km_bin": summary_by_bin,
+        }
+        eval_rows = scen_df[scen_df["has_target"]].copy()
+        if not eval_rows.empty:
+            scen_metrics = compute_all_metrics(
+                eval_rows["pred"].values,
+                eval_rows["target"].values,
+            )
+            scenario_results[letter].update({k: float(v) for k, v in scen_metrics.items()})
+            scenario_results[letter]["n_with_target"] = len(eval_rows)
+
+        logger.info(
+            "predict_routes escenario [%s]: %d rutas | km_tol=%.2f | score_thr=%.3f",
+            letter, len(scen_df), km_tol, score_threshold,
+        )
+
+    # ------------------------------------------------------------------ #
+    # 5. Guardar resumen global
+    # ------------------------------------------------------------------ #
+    summary = {
+        "n_routes_total": len(all_routes_df),
+        "n_routes_covered": n_covered,
+        "n_routes_missing_hop": n_missing_hop,
+        "scenarios": scenario_results,
+        "bin_results": bin_results
+    }
+    with open(out_dir / "summary.json", "w", encoding="utf-8") as fh:
+        _json.dump(summary, fh, indent=2, ensure_ascii=False, default=str)
+
+    return summary
 
 
 # ---------------------------------------------------------------------------
-# Evaluación de escenarios A/B/C derivados del CSV maestro
+# Evaluación de escenarios A/B/C derivados de route_candidates
 # ---------------------------------------------------------------------------
 
-def evaluate_scenarios_from_master(
+def evaluate_scenarios_from_routes(
     run_dir: Path,
     straightness_threshold: float = 0.9,
 ) -> Dict[str, Optional[Dict]]:
-    """Evalúa escenarios A/B/C filtrando desde eval_master/predictions.csv.
+    """Evalúa escenarios A/B/C filtrando desde eval_candidates/predictions.csv.
 
     No depende de CSVs externos: aplica los filtros de cada escenario sobre
-    las predicciones ya calculadas del subconjunto maestro (eval_master).
+    las predicciones ya calculadas del subconjunto maestro (eval_candidates).
 
     Para cada escenario (km_tolerance, curve_penalty) calcula:
         scenario_score   = straightness_index − curve_penalty · |km_offset| / (tol_prox + ε)
@@ -718,13 +762,13 @@ def evaluate_scenarios_from_master(
     """
     import json as _json
 
-    master_preds_path = run_dir / "eval_master" / "predictions.csv"
+    master_preds_path = run_dir / "route_predictions" / "all_routes.csv"
     results: Dict[str, Optional[Dict]] = {}
 
     if not master_preds_path.exists():
         logger.warning(
-            "evaluate_scenarios_from_master: eval_master/predictions.csv no encontrado en %s — "
-            "asegúrate de incluir 'master' en los subsets de evaluación",
+            "evaluate_scenarios_from_routes: route_predictions/all_routes.csv no encontrado en %s — "
+            "asegúrate de incluir 'candidates' en los subsets de evaluación",
             run_dir,
         )
         return results
@@ -732,14 +776,14 @@ def evaluate_scenarios_from_master(
     try:
         df = pd.read_csv(str(master_preds_path), low_memory=False)
     except Exception as exc:
-        logger.warning("evaluate_scenarios_from_master: error leyendo predictions.csv — %s", exc)
+        logger.warning("evaluate_scenarios_from_routes: error leyendo predictions.csv — %s", exc)
         return results
 
     required_cols = {"pred", "target", "tol_prox", "km_offset", "straightness_index"}
     missing = required_cols - set(df.columns)
     if missing:
         logger.warning(
-            "evaluate_scenarios_from_master: columnas faltantes en eval_master/predictions.csv — %s. "
+            "evaluate_scenarios_from_routes: columnas faltantes en eval_candidates/predictions.csv — %s. "
             "El CSV maestro debe incluir tol_prox, km_offset y straightness_index.",
             missing,
         )
@@ -820,7 +864,7 @@ def plot_training_results(
         training_curves.png     — train loss / val RMSE / val R² vs época
         predictions_scatter.png — pred vs target en test split
         error_distribution.png  — histograma de (pred − target) en segundos
-        rmse_by_km_bin.png      — RMSE por bin tol_prox (requiere eval_master)
+        rmse_by_km_bin.png      — RMSE por bin tol_prox (requiere eval_candidates)
 
     Cada plot se guarda en run_dir/ y se copia en src/outputs/reports/plots/.
     """
@@ -886,8 +930,8 @@ def plot_training_results(
         _save_plot(fig, run_dir / "error_distribution.png", _report_path("error_distribution.png"))
         plt.close(fig)
 
-    # --- 4. RMSE por bin tol_prox (eval_master) ---
-    master_preds_path = run_dir / "eval_master" / "predictions.csv"
+    # --- 4. RMSE por bin tol_prox (eval_candidates) ---
+    master_preds_path = run_dir / "eval_candidates" / "predictions.csv"
     if master_preds_path.exists():
         try:
             df_m = pd.read_csv(str(master_preds_path), low_memory=False)
@@ -1108,13 +1152,13 @@ def train_and_evaluate(
         error_distribution.png, rmse_by_km_bin.png
 
     Evaluación de subconjuntos (en orden):
-    1. eval_master/      — subconjunto maestro de master_segments.csv
+    1. eval_candidates/      — subconjunto maestro de master_segments.csv
     2. eval_straight/    — rutas rectas de straight_routes.csv
-    3. eval_scenario_A/  — derivado de eval_master filtrando por EVAL_SCENARIOS["A"]
+    3. eval_scenario_A/  — derivado de eval_candidates filtrando por EVAL_SCENARIOS["A"]
        eval_scenario_B/  — ídem para B
        eval_scenario_C/  — ídem para C
        Los escenarios A/B/C no requieren CSVs externos: se calculan sobre
-       las predicciones de eval_master usando km_offset y curve_penalty_score.
+       las predicciones de eval_candidates usando km_offset y curve_penalty_score.
 
     Args:
         master_csv:   Ruta a master_segments.csv. Si es None, se busca en la
@@ -1225,35 +1269,31 @@ def train_and_evaluate(
     except Exception as _e:
         run_logger.warning(f"No se pudieron guardar algunos artefactos: {_e}")
 
-    # --- Evaluación sobre master_segments ---
+    # --- Evaluación sobre route_candidates ---
     if evaluate:
-        _default_master = PROJECT_ROOT / "src" / "topsegments" / "master_segments.csv"
-        _default_straight = PROJECT_ROOT / "src" / "outputs" / "routes" / "straight_routes.csv"
-        _master_path = Path(master_csv) if master_csv is not None else _default_master
-
-        if _master_path.exists():
-            run_logger.info("Evaluando subconjunto master (master_segments.csv)...")
-            evaluate_on_subset(
-                model, data, edge_graph_df, nodes_path,
-                _master_path, "master", run_dir, device,  # subset_name="master"
+        # --- Predicción sobre rutas multi-hop de route_candidates.csv ---
+        _default_candidates = PROJECT_ROOT / "src" / "outputs" / "routes" / "route_candidates.csv"
+        if _default_candidates.exists():
+            run_logger.info("Prediciendo tiempos de rutas multi-hop desde route_candidates.csv...")
+            route_pred_summary = predict_routes(
+                model=model,
+                data=data,
+                edge_graph_df=edge_graph_df,
+                route_candidates_csv=_default_candidates,
+                config=config,
+                run_dir=run_dir,
+                device=device,
+                straightness_threshold=STRAIGHT_THRESHOLD,
+            )
+            run_logger.info(
+                "predict_routes: %d rutas cubiertas de %d totales",
+                route_pred_summary.get("n_routes_covered", 0),
+                route_pred_summary.get("n_routes_total", 0),
             )
         else:
             run_logger.warning(
-                "master_segments.csv no encontrado en %s — omitido. "
-                "Ejecuta --route-analysis para generarlo.",
-                _master_path,
-            )
-
-        if _default_straight.exists():
-            run_logger.info("Evaluando subconjunto straight (straight_routes.csv)...")
-            evaluate_on_subset(
-                model, data, edge_graph_df, nodes_path,
-                _default_straight, "straight", run_dir, device,
-            )
-        else:
-            run_logger.info(
-                "straight_routes.csv no encontrado en %s — omitido.",
-                _default_straight,
+                "route_candidates.csv no encontrado en %s — predicción multi-hop omitida.",
+                _default_candidates,
             )
 
     # --- Plots de entrenamiento ---
@@ -1266,14 +1306,7 @@ def train_and_evaluate(
         model_name=config.model,
     )
 
-    # --- Evaluación de escenarios A/B/C derivados de eval_master ---
-    run_logger.info("Evaluando escenarios A/B/C desde eval_master...")
-    scenario_results = evaluate_scenarios_from_master(
-        run_dir=run_dir,
-        straightness_threshold=config.straightness_threshold,
-    )
-
-    return {
+    result = {
         "model": config.model,
         "run_dir": str(run_dir),
         "processed_dir": str(processed_dir),
@@ -1282,6 +1315,16 @@ def train_and_evaluate(
         "elapsed_seconds": elapsed,
         "train_info": train_info,
         "final_metrics": final_metrics,
-        "stats": stats,
-        "scenario_results": scenario_results,
+        "stats": stats
     }
+
+    if evaluate:
+        # --- Evaluación de escenarios A/B/C derivados de eval_candidates ---
+        run_logger.info("Evaluando escenarios A/B/C desde eval_candidates...")
+        scenario_results = evaluate_scenarios_from_routes(
+            run_dir=run_dir,
+            straightness_threshold=STRAIGHT_THRESHOLD
+        )
+        result["scenario_results"] = scenario_results
+
+    return result
