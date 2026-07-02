@@ -335,26 +335,19 @@ def _load_processed_graph_as_pyg(
 
     target_col = _choose_target_column(edge_graph_df)
 
-    # Flags explícitos para ayudar al modelo a distinguir tipos de arista
-    if "spatial" in edge_graph_df.columns:
-        edge_graph_df["is_spatial"] = edge_graph_df["spatial"].apply(_as_bool).astype(float)
-    else:
-        edge_graph_df["is_spatial"] = 0.0
-
-    if "observed" in edge_graph_df.columns:
-        edge_graph_df["is_observed"] = edge_graph_df["observed"].apply(_as_bool).astype(float)
-    else:
-        edge_graph_df["is_observed"] = 0.0
-
-    edge_graph_df["edge_role"] = edge_graph_df.apply(_edge_role_from_row, axis=1)
-
-    # Features de arista: excluir identificadores y target
+    # Features de arista: excluir identificadores, target y columnas de roles obsoletos
     edge_feat_exclude = {
         "u",
         "v",
         "key",
         "geometry",
         "geometry_wkt",
+        "spatial",
+        "observed",
+        "is_spatial",
+        "is_observed",
+        "edge_role",
+        "route_ids",
         target_col,
     }
     edge_feature_df = _build_feature_frame(edge_graph_df, exclude_cols=edge_feat_exclude)
@@ -858,29 +851,16 @@ def plot_training_results(
     test_targets: np.ndarray,
     model_name: str = "",
 ) -> None:
-    """Genera y guarda plots clásicos de entrenamiento.
-
-    Plots generados:
-        training_curves.png     — train loss / val RMSE / val R² vs época
-        predictions_scatter.png — pred vs target en test split
-        error_distribution.png  — histograma de (pred − target) en segundos
-        rmse_by_km_bin.png      — RMSE por bin tol_prox (requiere eval_candidates)
-
-    Cada plot se guarda en run_dir/ y se copia en src/outputs/reports/plots/.
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        logger.warning("matplotlib no disponible; se omiten los plots de entrenamiento.")
-        return
 
     reports_plot_dir = PROJECT_ROOT / "src" / "outputs" / "reports" / "plots"
     ts = run_dir.name  # timestamp del run, e.g. 20260625_143022
 
     def _report_path(name: str) -> Path:
         return reports_plot_dir / f"{model_name}_{ts}_{name}"
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
     # --- 1. Curvas de entrenamiento ---
     if history.get("epoch"):
@@ -890,14 +870,17 @@ def plot_training_results(
         axes[0].plot(history["epoch"], history["train_loss"], color="steelblue")
         axes[0].set_xlabel("Época"); axes[0].set_ylabel("MSE Loss")
         axes[0].set_title("Train Loss"); axes[0].grid(alpha=0.3)
+        axes[0].set_ylim(0, 20)
 
         axes[1].plot(history["epoch"], history["val_rmse"], color="darkorange")
         axes[1].set_xlabel("Época"); axes[1].set_ylabel("RMSE (s)")
         axes[1].set_title("Val RMSE"); axes[1].grid(alpha=0.3)
+        axes[1].set_ylim(50, 300)
 
         axes[2].plot(history["epoch"], history["val_r2"], color="seagreen")
         axes[2].set_xlabel("Época"); axes[2].set_ylabel("R²")
         axes[2].set_title("Val R²"); axes[2].grid(alpha=0.3)
+        axes[2].set_ylim(-1, 1)
 
         plt.tight_layout()
         _save_plot(fig, run_dir / "training_curves.png", _report_path("training_curves.png"))
@@ -910,6 +893,8 @@ def plot_training_results(
         lo = min(float(test_targets.min()), float(test_preds.min())) * 0.95
         hi = max(float(test_targets.max()), float(test_preds.max())) * 1.05
         ax.plot([lo, hi], [lo, hi], "r--", linewidth=1, label="Ideal")
+        ax.set_xlim(0, 400)
+        ax.set_ylim(0, 400)
         ax.set_xlabel("Target (s)"); ax.set_ylabel("Predicción (s)")
         ax.set_title(f"Predicciones vs Targets — {model_name.upper()}")
         ax.legend(); ax.grid(alpha=0.3)
@@ -917,7 +902,7 @@ def plot_training_results(
         _save_plot(fig, run_dir / "predictions_scatter.png", _report_path("predictions_scatter.png"))
         plt.close(fig)
 
-    # --- 3. Distribución de errores ---
+    # Distribución de errores (points)
     if len(test_preds) > 0:
         errors = test_preds - test_targets
         fig, ax = plt.subplots(figsize=(7, 4))
@@ -925,13 +910,14 @@ def plot_training_results(
         ax.axvline(0, color="red", linestyle="--", linewidth=1, label="Error = 0")
         ax.set_xlabel("Error (pred − target) [s]"); ax.set_ylabel("Frecuencia")
         ax.set_title(f"Distribución de errores — {model_name.upper()}")
+        ax.set_xlim(-400, 400)
         ax.legend(); ax.grid(alpha=0.3)
         plt.tight_layout()
         _save_plot(fig, run_dir / "error_distribution.png", _report_path("error_distribution.png"))
         plt.close(fig)
 
-    # --- 4. RMSE por bin tol_prox (eval_candidates) ---
-    master_preds_path = run_dir / "eval_candidates" / "predictions.csv"
+    # --- 4. RMSE por bin tol_prox (all routes) ---
+    master_preds_path = run_dir / "route_predictions" / "all_routes.csv"
     if master_preds_path.exists():
         try:
             df_m = pd.read_csv(str(master_preds_path), low_memory=False)
@@ -1063,7 +1049,7 @@ def fit_model(model: nn.Module, data: Data, config: Config, run_dir: Optional[Pa
         run_dir: Si se indica, guarda `best_model.pt` en esa carpeta cada vez
             que se encuentra un nuevo mejor modelo.
     """
-    
+
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=config.learning_rate,
@@ -1089,7 +1075,6 @@ def fit_model(model: nn.Module, data: Data, config: Config, run_dir: Optional[Pa
                 mask_name="val"
             )
             val_mse = val_metrics["mse"]
-
             history["epoch"].append(epoch)
             history["train_loss"].append(train_loss)
             history["val_mse"].append(val_mse)
@@ -1100,7 +1085,7 @@ def fit_model(model: nn.Module, data: Data, config: Config, run_dir: Optional[Pa
             logger.info(
                 f"Epoch {epoch:4d}/{config.epochs} | "
                 f"Train Loss: {train_loss:.4f} | "
-                f"Val MSE: {val_metrics['mse']:.4f} | "
+                # f"Val MSE: {val_metrics['mse']:.4f} | "
                 f"Val MAE: {val_metrics['mae']:.4f} | "
                 f"Val R²: {val_metrics['r2']:.4f}"
             )
@@ -1134,11 +1119,9 @@ def fit_model(model: nn.Module, data: Data, config: Config, run_dir: Optional[Pa
         model.load_state_dict(best_state)
     return history
 
-
 def train_and_evaluate(
     config: Config,
     processed_dir: Optional[Path] = None,
-    master_csv: Optional[Path] = None,
     evaluate: bool = False,
 ) -> Dict[str, object]:
     """Pipeline completo: carga datos, entrena, evalúa en test y guarda artefactos.
@@ -1152,13 +1135,12 @@ def train_and_evaluate(
         error_distribution.png, rmse_by_km_bin.png
 
     Evaluación de subconjuntos (en orden):
-    1. eval_candidates/      — subconjunto maestro de master_segments.csv
-    2. eval_straight/    — rutas rectas de straight_routes.csv
-    3. eval_scenario_A/  — derivado de eval_candidates filtrando por EVAL_SCENARIOS["A"]
+    1. eval_master/      — subconjunto maestro de master_segments.csv
+    2. eval_scenario_A/  — derivado de eval_master filtrando por EVAL_SCENARIOS["A"]
        eval_scenario_B/  — ídem para B
        eval_scenario_C/  — ídem para C
        Los escenarios A/B/C no requieren CSVs externos: se calculan sobre
-       las predicciones de eval_candidates usando km_offset y curve_penalty_score.
+       las predicciones de eval_master usando km_offset y curve_penalty_score.
 
     Args:
         master_csv:   Ruta a master_segments.csv. Si es None, se busca en la
@@ -1211,6 +1193,15 @@ def train_and_evaluate(
     final_metrics, preds = evaluate_model(model, data, mask_name="test")
     test_preds = preds[data.test_mask].detach().cpu().numpy()
     test_targets = data.y[data.test_mask].detach().cpu().numpy()
+
+    scaler = getattr(data, "target_scaler", None)
+    if scaler is not None:
+        test_preds = scaler.inverse_transform(
+            test_preds.reshape(-1,1)
+        ).ravel()
+        test_targets = scaler.inverse_transform(
+            test_targets.reshape(-1,1)
+        ).ravel()
     stats = travel_time_stats(test_preds, test_targets)
 
     run_logger.info("=" * 60)
@@ -1280,7 +1271,6 @@ def train_and_evaluate(
                 data=data,
                 edge_graph_df=edge_graph_df,
                 route_candidates_csv=_default_candidates,
-                config=config,
                 run_dir=run_dir,
                 device=device,
                 straightness_threshold=STRAIGHT_THRESHOLD,
@@ -1317,14 +1307,4 @@ def train_and_evaluate(
         "final_metrics": final_metrics,
         "stats": stats
     }
-
-    if evaluate:
-        # --- Evaluación de escenarios A/B/C derivados de eval_candidates ---
-        run_logger.info("Evaluando escenarios A/B/C desde eval_candidates...")
-        scenario_results = evaluate_scenarios_from_routes(
-            run_dir=run_dir,
-            straightness_threshold=STRAIGHT_THRESHOLD
-        )
-        result["scenario_results"] = scenario_results
-
     return result

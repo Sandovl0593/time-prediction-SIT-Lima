@@ -101,6 +101,18 @@ def _order_points_1d(
 # La implementación anterior basada en PCA fue eliminada; usar
 # _order_points_1d junto con _rustic_1d_projection.
 
+
+def _id_prefix(stop_id: str) -> str:
+    """Extrae el prefijo de letras de un GTFS Stop ID.
+
+    Ejemplos: 'D22' → 'D', 'F14' → 'F', 'R35' → 'R', '416' → 'numeric'.
+    Permite agrupar estaciones de la misma familia dentro de una Line
+    y evitar conexiones entre familias distintas (ej. D22 → F14).
+    """
+    m = re.match(r'^([A-Za-z]+)', str(stop_id))
+    return m.group(1).upper() if m else "numeric"
+
+
 def _load_nodes_from_csv(path: str) -> gpd.GeoDataFrame:
     print(f"[gen_pipeline] Reading stations CSV from {path}")
     df = pd.read_csv(path)
@@ -128,34 +140,55 @@ def _load_nodes_from_csv(path: str) -> gpd.GeoDataFrame:
 
 
 def _build_lines_from_nodes(gdf_nodes: gpd.GeoDataFrame):
-    print("[gen_pipeline] Building LineString geometries per 'Line' (assume header exists)")
+    """Construye geometrías LineString y ordenes de parada por Line.
+
+    Sub-agrupa cada Line por prefijo de GTFS Stop ID (letras iniciales) para
+    evitar conectar estaciones de familias distintas (ej. D22 → F14 en la misma
+    línea corredor). Dentro de cada sub-grupo ordena por posición geográfica
+    (proyección 1D + 2-opt) en lugar de orden alfanumérico.
+
+    La clave compuesta ``"{line}|{prefix}"`` se usa como valor de ``Line`` en
+    ``gdf_lines`` y ``line_orders``; ``line_base`` guarda el nombre original
+    para visualización.
+    """
+    print("[gen_pipeline] Building LineString geometries per 'Line' with prefix sub-grouping")
     lines = []
-    line_orders = []  # list of (line_name, ordered_gdf)
+    line_orders = []  # list of (comp_key, ordered_gdf, stop_ids)
     for line_name, sub in gdf_nodes.groupby("Line"):
-        sub = sub.dropna(subset=["_x", "_y"]) if len(sub) > 0 else sub
+        sub = sub.dropna(subset=["_x", "_y"])
         if len(sub) < 2:
             continue
-        coords = np.vstack([sub["_x"].values, sub["_y"].values]).T
 
-        # Orden inicial rústico + refinamiento 2-opt para evitar zigzags
-        try:
-            order = _order_points_1d(coords)
-            ordered = sub.iloc[order]
-        except Exception:
-            # Fallback simple si algo falla: ordenar por coordenada dominante
-            proj = _rustic_1d_projection(coords)
-            order = np.argsort(proj)
-            ordered = sub.iloc[order]
+        # Clasificar cada estación por su prefijo de letras
+        sub = sub.copy()
+        sub["_prefix"] = sub["GTFS Stop ID"].astype(str).apply(_id_prefix)
 
-        # Lista ordenada de GTFS Stop IDs — usada en compute_and_save_metrics
-        # para emitir start_stop_id/end_stop_id en lugar de índices posicionales
-        stop_ids = list(ordered["GTFS Stop ID"].astype(str))
-        line_orders.append((line_name, ordered, stop_ids))
+        for prefix, prefix_sub in sub.groupby("_prefix"):
+            if len(prefix_sub) < 2:
+                continue
 
-        # crear LineString en WGS84 (lon, lat)
-        line_coords = list(zip(ordered["GTFS Longitude"].values, ordered["GTFS Latitude"].values))
-        line_geom = LineString(line_coords)
-        lines.append({"Line": line_name, "num_stations": len(ordered), "geometry": line_geom})
+            # Ordenar geográficamente dentro del sub-grupo (evita zigzags)
+            # coords = prefix_sub[["_x", "_y"]].values.astype(float)
+            ordered = prefix_sub.iloc[
+                prefix_sub["GTFS Stop ID"].astype(str).argsort(kind="stable")
+            ]
+
+            comp_key = f"{line_name}|{prefix}"
+
+            # Lista ordenada de GTFS Stop IDs
+            stop_ids = list(ordered["GTFS Stop ID"].astype(str))
+            line_orders.append((comp_key, ordered, stop_ids))
+
+            # LineString en WGS84
+            line_coords = list(zip(ordered["GTFS Longitude"].values, ordered["GTFS Latitude"].values))
+            line_geom = LineString(line_coords)
+            lines.append({
+                "Line": comp_key,
+                "line_base": line_name,
+                "prefix_group": prefix,
+                "num_stations": len(ordered),
+                "geometry": line_geom,
+            })
 
     gdf_lines = gpd.GeoDataFrame(lines, geometry="geometry", crs="EPSG:4326")
     return gdf_lines, line_orders
@@ -480,12 +513,17 @@ def compute_and_save_metrics(
     if gdf_lines is not None and not gdf_lines.empty:
         gdf_proj = gdf_lines.to_crs(epsg=3857)
 
-        # Construir lookup line_name → stop_ids desde line_orders cuando esté disponible
+        # Construir lookups line_name → stop_ids y line_name → line_base
         stop_ids_by_line: Dict[str, list] = {}
+        line_base_by_line: Dict[str, str] = {}
         if line_orders:
             for entry in line_orders:
                 lname, _ordered, sids = entry
                 stop_ids_by_line[lname] = sids
+        # line_base_by_line desde gdf_lines (columna line_base si existe)
+        if "line_base" in gdf_lines.columns:
+            for _, lr in gdf_lines.iterrows():
+                line_base_by_line[lr["Line"]] = lr["line_base"]
 
         for idx, row in gdf_lines.iterrows():
             geom = row.geometry
@@ -550,6 +588,7 @@ def compute_and_save_metrics(
                     route_metrics_rows.append({
                         "scenario_id": scenario_id,
                         "line": line_name,
+                        "line_base": line_base_by_line.get(line_name, line_name.split("|")[0]),
                         "start_stop_id": stop_ids[i],
                         "end_stop_id": stop_ids[j],
                         "hops": json.dumps(hop_stop_ids),   # ← nuevo campo

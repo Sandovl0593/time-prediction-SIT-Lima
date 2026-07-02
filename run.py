@@ -82,25 +82,14 @@ def main():
     args = parse_args()
 
     if args.model:
-        # Construir config, solo sobrescribir valores explícitos
-        config_kwargs = {"model": args.model}
-        for key in [
-            "hidden_dim", "num_layers",
-            "dropout", "lr", "weight_decay", "epochs", "seed", "num_time_steps",
-            "device",
-        ]:
-            val = getattr(args, key)
-            if val is not None:
-                config_kwargs[key] = val
+    
+        print("=== EVALUATOR GAT ====\n")
+        config1_gat = Config(model="gat")
+        train_and_evaluate(config1_gat, evaluate=True)
 
-        config = Config(**config_kwargs)
-
-        # Process the model training and evaluation if not in a special mode
-        if not (args.process_nyc or args.view_file or args.show_processed):
-            # master_segments.csv y straight_routes.csv se buscan en las rutas
-            # por defecto; si no existen, train_and_evaluate los omite sin error.
-            # Los escenarios A/B/C se derivan automáticamente de eval_master.
-            train_and_evaluate(config)
+        print("\n\n=== EVALUATOR GATV2 ====\n")
+        config2_gat2 = Config(model="gatv2")
+        train_and_evaluate(config2_gat2, evaluate=True)
 
     # Si se solicita procesar los datos raw de NYC, ejecutar el pipeline
     if args.process_nyc:
@@ -170,7 +159,7 @@ def main():
         processed_dir = os.path.join("src", "data", "processed", "graph")
         print("[run.py] Showing processed graph visualization from src/data/processed/graph")
         try:
-            visualize_nodes_edges(processed_dir=processed_dir, show_labels=False, node_size=5)
+            visualize_nodes_edges(processed_dir=processed_dir, show_labels=True, node_size=5)
         except Exception as e:
             print(f"[run.py] Failed to visualize processed graph: {e}")
             return 1
