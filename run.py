@@ -159,7 +159,7 @@ def main():
         processed_dir = os.path.join("src", "data", "processed", "graph")
         print("[run.py] Showing processed graph visualization from src/data/processed/graph")
         try:
-            visualize_nodes_edges(processed_dir=processed_dir, show_labels=True, node_size=5)
+            visualize_nodes_edges(processed_dir=processed_dir, edge_width=3.0, show_labels=False, node_size=7)
         except Exception as e:
             print(f"[run.py] Failed to visualize processed graph: {e}")
             return 1

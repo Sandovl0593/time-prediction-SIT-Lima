@@ -139,6 +139,16 @@ def _load_nodes_from_csv(path: str) -> gpd.GeoDataFrame:
     return gdf_nodes
 
 
+# HARDCORE LINES
+LINE_EXCEPTIONS = [
+    ("H01", "H04"), ("H12", "H15"), ("H06", "H11"),
+    ("233", "257"),
+    ("F09", "F12"), ("F01", "F07"),
+    ("418", "420"), ("621", "640"),
+    ("201", "227"), ("301", "302")
+]
+
+
 def _build_lines_from_nodes(gdf_nodes: gpd.GeoDataFrame):
     """Construye geometrías LineString y ordenes de parada por Line.
 
@@ -173,22 +183,60 @@ def _build_lines_from_nodes(gdf_nodes: gpd.GeoDataFrame):
                 prefix_sub["GTFS Stop ID"].astype(str).argsort(kind="stable")
             ]
 
+            # si el primer id de ordered existe en los comienzos de LINE_EXCEPTIONS, solo aplicar la linea hasta el final de la excepcion
+            first_id = str(ordered["GTFS Stop ID"].iloc[0])
+            is_exception = any(first_id == start_id for start_id, _ in LINE_EXCEPTIONS)
+            for start_id, end_id in LINE_EXCEPTIONS:
+                if first_id == start_id:
+                    # buscar el índice del end_id en ordered
+                    end_idx = ordered[ordered["GTFS Stop ID"].astype(str) == end_id].index
+                    if not end_idx.empty:
+                        # recortar ordered hasta el índice de end_id (inclusive)
+                        ret_ordered = ordered.loc[:end_idx[0]]
+                    break
+            if not is_exception:
+                ret_ordered = ordered
+    
             comp_key = f"{line_name}|{prefix}"
+            stop_ids = list(ret_ordered["GTFS Stop ID"].astype(str))
+            line_orders.append((comp_key, ret_ordered, stop_ids))
 
-            # Lista ordenada de GTFS Stop IDs
-            stop_ids = list(ordered["GTFS Stop ID"].astype(str))
-            line_orders.append((comp_key, ordered, stop_ids))
+            if is_exception:                
+                # a partir del end de la excepcion terminar con el end original de la linea
+                last_id = str(ret_ordered["GTFS Stop ID"].iloc[-1])
+                rest_of_line = ordered[ordered["GTFS Stop ID"].astype(str) > last_id]
+
+                if len(rest_of_line) >= 2:
+                    # Ordenar el resto de la línea por GTFS Stop ID si sobró
+                    comp_key_rest = f"{line_name}|{prefix}_rest"
+                    stop_ids_rest = list(rest_of_line["GTFS Stop ID"].astype(str))
+                    line_orders.append((comp_key_rest, rest_of_line, stop_ids_rest))
+
 
             # LineString en WGS84
-            line_coords = list(zip(ordered["GTFS Longitude"].values, ordered["GTFS Latitude"].values))
+            line_coords = list(zip(ret_ordered["GTFS Longitude"].values, ret_ordered["GTFS Latitude"].values))
             line_geom = LineString(line_coords)
             lines.append({
                 "Line": comp_key,
                 "line_base": line_name,
                 "prefix_group": prefix,
-                "num_stations": len(ordered),
+                "num_stations": len(ret_ordered),
                 "geometry": line_geom,
             })
+
+            if is_exception and len(rest_of_line) >= 2:
+                # añadir el resto en lines
+                line_coords_rest = list(zip(rest_of_line["GTFS Longitude"].values, rest_of_line["GTFS Latitude"].values))
+                line_geom_rest = LineString(line_coords_rest)
+                lines.append({
+                    "Line": comp_key_rest,
+                    "line_base": line_name,
+                    "prefix_group": prefix,
+                    "num_stations": len(rest_of_line),
+                    "geometry": line_geom_rest,
+                })
+
+
 
     gdf_lines = gpd.GeoDataFrame(lines, geometry="geometry", crs="EPSG:4326")
     return gdf_lines, line_orders

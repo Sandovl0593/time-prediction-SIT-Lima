@@ -31,7 +31,7 @@ def visualize_nodes_edges(
     node_size: int = 30,
     node_color: str = "tab:red",
     edge_color: str = "gray",
-    edge_width: float = 1.0,
+    edge_width: float = 2.0,
     edge_alpha: float = 0.7,
     colormap_name: str = "tab20",
 ) -> plt.Axes:
