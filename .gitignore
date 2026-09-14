@@ -2,7 +2,6 @@ env/
 .vscode/
 __pycache__/
 */__pycache__/
-**/processed/*/*.json
-**/processed/*/*.log
-**/*.csv
+**/processed/*/*.csv
+**/data/rawNYC/*.csv
 outputs/
