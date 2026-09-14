@@ -26,11 +26,10 @@ Campos:
 - `coordenadas`: `string`, par (lat,lon) en grados decimales.
 
 
-#### 3. Estaciones de los servicios de trenes de Metro de Lima
+#### 3. Estaciones de los servicios de transporte en general
 Descripción: stations_Linea1.csv, stattions_linea2.csv (CSV separado por ";")
 
 Campos:
 - `estacion`: `string`. Nombre de la estación.
-- `distrito`: `string`. Distrito ubicado.
-- `ubicacion`: `string`. Formato `[av1] / [av2]`, donde `av1` es la avenida incidente y `av2`, la avenida de cruce (cercana).
+- `servicio`: `string`. Servicio de transporte
 - `coordenadas`: `string`, par (lat,lon) en grados decimales.
