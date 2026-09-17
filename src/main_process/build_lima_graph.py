@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
+import unicodedata
 from pathlib import Path
 
 import networkx as nx
@@ -20,6 +22,13 @@ REQUIRED_COLUMNS = {
     "GTFS Longitude",
 }
 
+# A transfer is a walking connection between stations belonging to different
+# services.  The value is deliberately conservative: it represents a short,
+# accessible interchange and can be changed from the command line when a more
+# detailed interchange inventory is available.
+DEFAULT_TRANSFER_DISTANCE_M = 250.0
+TRANSFER_GROUP_COLUMNS = ("Transfer Group", "transfer_group", "TransferGroup")
+
 
 def _haversine_meters(
     latitude_a: float,
@@ -35,8 +44,114 @@ def _haversine_meters(
     return 2 * radius_m * math.asin(math.sqrt(hav))
 
 
-def build_lima_graph(stations_path: Path, output_dir: Path) -> nx.MultiDiGraph:
-    """Crea un MultiDiGraph dirigido con conexiones entre paradas consecutivas."""
+def _normalise_station_name(value: object) -> str:
+    """Normalise a station name for matching interchange labels."""
+    text = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def _add_transfer_edges(
+    graph: nx.MultiDiGraph,
+    stations: pd.DataFrame,
+    max_distance_m: float,
+) -> int:
+    """Add bidirectional transfer edges between stations on different lines.
+
+    A pair is considered an interchange when it has an explicit transfer
+    group, or when the stations lie within ``max_distance_m``.  A matching
+    normalised name is retained as provenance, but never overrides the
+    distance threshold: names such as ``Universidad`` occur at unrelated,
+    distant locations.  This lets the current CSV generate a conservative
+    topology from coordinates while giving a future inventory of transfer
+    groups precedence over geographic proximity.
+    """
+    if max_distance_m <= 0:
+        return 0
+
+    records = stations.to_dict("records")
+    transfer_count = 0
+    for index, first in enumerate(records):
+        first_line = str(first["Line"])
+        first_id = str(first["Station ID"])
+        first_name = _normalise_station_name(first["Station Name"])
+        first_groups = {
+            str(first[column]).strip()
+            for column in TRANSFER_GROUP_COLUMNS
+            if column in first and pd.notna(first[column]) and str(first[column]).strip()
+        }
+
+        for second in records[index + 1 :]:
+            second_line = str(second["Line"])
+            if first_line == second_line:
+                continue
+
+            second_id = str(second["Station ID"])
+            second_name = _normalise_station_name(second["Station Name"])
+            second_groups = {
+                str(second[column]).strip()
+                for column in TRANSFER_GROUP_COLUMNS
+                if column in second and pd.notna(second[column]) and str(second[column]).strip()
+            }
+            distance_m = _haversine_meters(
+                float(first["GTFS Latitude"]),
+                float(first["GTFS Longitude"]),
+                float(second["GTFS Latitude"]),
+                float(second["GTFS Longitude"]),
+            )
+            shared_group = bool(first_groups.intersection(second_groups))
+            same_name = bool(first_name) and first_name == second_name
+            nearby = distance_m <= max_distance_m
+            if not (shared_group or nearby):
+                continue
+
+            connection_basis = (
+                "transfer_group"
+                if shared_group
+                else "matching_name_and_proximity"
+                if same_name
+                else "proximity"
+            )
+
+            geometry = LineString(
+                [
+                    (float(first["GTFS Longitude"]), float(first["GTFS Latitude"])),
+                    (float(second["GTFS Longitude"]), float(second["GTFS Latitude"])),
+                ]
+            )
+            attributes = {
+                "line": "TRANSFER",
+                "source_line": first_line,
+                "target_line": second_line,
+                "length_m": distance_m,
+                "transfer_distance_m": distance_m,
+                "transfer_basis": connection_basis,
+                "spatial": False,
+                "transfer": True,
+                "edge_type": "transfer",
+                "structure": "Transfer",
+                "geometry": geometry,
+            }
+            graph.add_edge(first_id, second_id, **attributes)
+            graph.add_edge(
+                second_id,
+                first_id,
+                **{
+                    **attributes,
+                    "source_line": second_line,
+                    "target_line": first_line,
+                    "geometry": LineString(list(geometry.coords)[::-1]),
+                },
+            )
+            transfer_count += 2
+    return transfer_count
+
+
+def build_lima_graph(
+    stations_path: Path,
+    output_dir: Path,
+    transfer_distance_m: float = DEFAULT_TRANSFER_DISTANCE_M,
+) -> nx.MultiDiGraph:
+    """Crea un MultiDiGraph con aristas de línea y de transferencia."""
     stations = pd.read_csv(stations_path, encoding="utf-8-sig")
     missing = REQUIRED_COLUMNS.difference(stations.columns)
     if missing:
@@ -82,6 +197,8 @@ def build_lima_graph(stations_path: Path, output_dir: Path) -> nx.MultiDiGraph:
                 "line": line,
                 "length_m": length_m,
                 "spatial": True,
+                "transfer": False,
+                "edge_type": "in_line",
                 "structure": "At Grade",
                 "geometry": edge_geometry,
             }
@@ -92,6 +209,7 @@ def build_lima_graph(stations_path: Path, output_dir: Path) -> nx.MultiDiGraph:
                 **{**edge_attributes, "geometry": LineString(list(edge_geometry.coords)[::-1])},
             )
 
+    _add_transfer_edges(graph, stations, transfer_distance_m)
     _save_graph(graph, stations, output_dir)
     return graph
 
@@ -142,8 +260,17 @@ def main() -> None:
         type=Path,
         default=Path(__file__).parents[1] / "data" / "processedLima",
     )
+    parser.add_argument(
+        "--transfer-distance-m",
+        type=float,
+        default=DEFAULT_TRANSFER_DISTANCE_M,
+        help=(
+            "Distancia máxima, en metros, para inferir una transferencia entre "
+            "estaciones de líneas distintas (por defecto: %(default)s)."
+        ),
+    )
     args = parser.parse_args()
-    graph = build_lima_graph(args.stations, args.output_dir)
+    graph = build_lima_graph(args.stations, args.output_dir, args.transfer_distance_m)
     print(f"Grafo escrito en {args.output_dir}: {graph.number_of_nodes()} nodos, {graph.number_of_edges()} aristas")
 
 

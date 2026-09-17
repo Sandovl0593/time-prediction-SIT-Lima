@@ -14,8 +14,11 @@ import os
 import json
 
 from src.main_process.general_pipeline import general_pipeline, load_processed_gdfs
-from src.main_process.visualize import visualize_segments_csv, visualize_nodes_edges
+from src.main_process.visualizeNYC import visualize_segments_csv, visualize_nodes_edges
 from src.train.trainer import train_and_evaluate
+from src.main_process.project_lima_times import project_lima_times
+from src.routes.lima_p0 import build_lima_p0_candidates
+from src.routes.evaluate_p0 import evaluate_predictions
 
 from src.config import Config
 
@@ -36,6 +39,16 @@ def parse_args():
     parser.add_argument("--cleaning-config", type=str, default=None, help="Ruta a JSON con umbrales/configuración de limpieza")
     parser.add_argument("--clean-outputs", action="store_true", help="Eliminar la carpeta src/outputs (limpieza de artefactos) antes de ejecutar")
     parser.add_argument("-r", "--route-analysis", action="store_true", help="Ejecutar análisis de rutas (estadísticas, distribución, rutas rectas)")
+    parser.add_argument(
+        "--project-lima-times",
+        action="store_true",
+        help="Proyectar travel_time_s de escenario para las aristas del grafo de Lima",
+    )
+    parser.add_argument(
+        "--lima-p0",
+        action="store_true",
+        help="Generar etiquetas/rutas P0 de Lima y entrenar GAT y GATv2 sin curva ni densidad",
+    )
 
     parser.add_argument(
         "--eval-subsets",
@@ -80,6 +93,43 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    lima_graph_dir = os.path.join("src", "data", "processedLima")
+    lima_p0_candidates = os.path.join("src", "outputs", "lima", "p0_route_candidates.csv")
+
+    if args.project_lima_times or args.lima_p0:
+        projection = project_lima_times(
+            lima_graph_dir,
+            os.path.join("src", "data", "processed", "graph"),
+        )
+        print("[run.py] Tiempos proyectados para Lima:", projection["edges_path"])
+
+    if args.lima_p0:
+        candidates = build_lima_p0_candidates(lima_graph_dir, lima_p0_candidates)
+        print(f"[run.py] Rutas P0 Lima: {len(candidates)}")
+        p0_results = []
+        for model_name in ("gat", "gatv2"):
+            p0_config = Config(
+                model=model_name,
+                feature_profile="p0",
+                epochs=args.epochs or 200,
+                seed=args.seed if args.seed is not None else 42,
+                device=args.device or "cpu",
+            )
+            result = train_and_evaluate(
+                p0_config,
+                processed_dir=lima_graph_dir,
+                evaluate=True,
+                route_candidates_csv=lima_p0_candidates,
+            )
+            route_predictions = os.path.join(result["run_dir"], "route_predictions", "all_routes.csv")
+            p0_results.append(evaluate_predictions(route_predictions, model_name.upper()))
+
+        import pandas as pd
+        report_path = os.path.join("src", "outputs", "lima", "p0_metrics.csv")
+        pd.concat(p0_results, ignore_index=True).to_csv(report_path, index=False, float_format="%.6f")
+        print(f"[run.py] Reporte P0 Lima: {report_path}")
+        return 0
 
     if args.model:
     

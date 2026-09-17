@@ -1,0 +1,14 @@
+{
+  "lima_edges": 540,
+  "in_line_edges": 484,
+  "transfer_edges": 56,
+  "nyc_reference_edges": 972,
+  "global_reference_rate_s_per_m": 0.10990265272797678,
+  "k_neighbors": 12,
+  "brt_scale": 1.15,
+  "rail_scale": 1.0,
+  "transfer_fixed_s": 45.0,
+  "walking_speed_mps": 1.2,
+  "edges_path": "src\\data\\processedLima\\edges.csv",
+  "projected_trips_path": "src\\data\\processedLima\\projected_trip_times.csv"
+}

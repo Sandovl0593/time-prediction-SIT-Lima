@@ -24,7 +24,6 @@ from sklearn.preprocessing import StandardScaler
 from src.config import Config, EVAL_SCENARIOS, STRAIGHT_THRESHOLD
 from src.models.gat_model import TravelTimeGAT
 from src.models.gatv2_model import TravelTimeGATv2
-from src.models.graphsage_model import TravelTimeGraphSAGE
 from src.utils.metrics import compute_all_metrics, travel_time_stats
 from src.utils.others import get_logger, set_seed
 
@@ -310,6 +309,10 @@ def _load_processed_graph_as_pyg(
 
     # Features de nodo
     node_feat_exclude = {"gtfs stop id", "geometry", "geometry_wkt"}
+    if config.feature_profile == "p0":
+        node_feat_exclude.update(
+            column.lower() for column in nodes_df.columns if "density" in column.lower()
+        )
     node_feature_df = _build_feature_frame(nodes_df, exclude_cols=node_feat_exclude)
 
     if node_feature_df.shape[1] == 1 and "bias" in node_feature_df.columns:
@@ -350,6 +353,24 @@ def _load_processed_graph_as_pyg(
         "route_ids",
         target_col,
     }
+    if config.feature_profile == "p0":
+        edge_feat_exclude.update(
+            column.lower()
+            for column in edge_graph_df.columns
+            if (
+                "curve" in column.lower()
+                or "density" in column.lower()
+                or column.lower()
+                in {
+                    "time_source",
+                    "projection_method",
+                    "projection_distance",
+                    "projection_quality",
+                    "reference_count",
+                    "temporal_rate_s_per_m",
+                }
+            )
+        )
     edge_feature_df = _build_feature_frame(edge_graph_df, exclude_cols=edge_feat_exclude)
 
     # Filtrar aristas que sí conectan nodos existentes
@@ -602,6 +623,7 @@ def predict_routes(
                     else float("nan")
                 )
                 covered = True
+                n_covered += 1
             else:
                 pred_time = float("nan")
                 target_time = float("nan")
@@ -953,16 +975,6 @@ def build_model(config: Config, in_channels: int, edge_attr_dim: int) -> nn.Modu
         raise ValueError(
             f"{config.model} requiere num_layers >= 2 para que la dimensión final del encoder sea estable."
         )
-
-    if config.model == "graphsage":
-        return TravelTimeGraphSAGE(
-            in_channels=in_channels,
-            hidden_dim=config.hidden_dim,
-            num_layers=config.num_layers,
-            edge_attr_dim=edge_attr_dim,
-            dropout=config.dropout,
-        )
-
     if config.model == "gat":
         return TravelTimeGAT(
             in_channels=in_channels,
@@ -1123,6 +1135,7 @@ def train_and_evaluate(
     config: Config,
     processed_dir: Optional[Path] = None,
     evaluate: bool = False,
+    route_candidates_csv: Optional[Path] = None,
 ) -> Dict[str, object]:
     """Pipeline completo: carga datos, entrena, evalúa en test y guarda artefactos.
 
@@ -1248,13 +1261,17 @@ def train_and_evaluate(
         with open(run_dir / "final_metrics.json", "w", encoding="utf-8") as fh:
             _json.dump(artifacts_metrics, fh, indent=2, ensure_ascii=False, default=str)
 
-        # test_predictions.csv
+        # test_predictions.csv. Se preservan los identificadores de arista y
+        # longitud para que P0 pueda agrupar el mismo test por bins de km.
         test_edge_indices = data.test_mask.nonzero(as_tuple=False).squeeze(1).cpu().numpy()
-        pd.DataFrame({
-            "edge_idx": test_edge_indices,
-            "pred": test_preds,
-            "target": test_targets,
-        }).to_csv(run_dir / "test_predictions.csv", index=False)
+        test_edge_rows = edge_graph_df.iloc[test_edge_indices].reset_index(drop=True)
+        test_prediction_df = test_edge_rows.reindex(
+            columns=[column for column in ["u", "v", "key", "line", "edge_type", "length_m"] if column in test_edge_rows]
+        ).copy()
+        test_prediction_df.insert(0, "edge_idx", test_edge_indices)
+        test_prediction_df["pred"] = test_preds
+        test_prediction_df["target"] = test_targets
+        test_prediction_df.to_csv(run_dir / "test_predictions.csv", index=False)
 
         run_logger.info(f"Artefactos guardados en {run_dir}")
     except Exception as _e:
@@ -1263,9 +1280,13 @@ def train_and_evaluate(
     # --- Evaluación sobre route_candidates ---
     if evaluate:
         # --- Predicción sobre rutas multi-hop de route_candidates.csv ---
-        _default_candidates = PROJECT_ROOT / "src" / "outputs" / "routes" / "route_candidates.csv"
+        _default_candidates = (
+            Path(route_candidates_csv)
+            if route_candidates_csv is not None
+            else PROJECT_ROOT / "src" / "outputs" / "routes" / "route_candidates.csv"
+        )
         if _default_candidates.exists():
-            run_logger.info("Prediciendo tiempos de rutas multi-hop desde route_candidates.csv...")
+            run_logger.info("Prediciendo tiempos de rutas multi-hop desde %s...", _default_candidates)
             route_pred_summary = predict_routes(
                 model=model,
                 data=data,

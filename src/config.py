@@ -61,6 +61,9 @@ class Config:
     print_every: int = 1
 
     device: str = "cpu"
+    # P0 usa solamente topología y variables espaciales disponibles. Los
+    # perfiles posteriores habilitarán atributos de curvatura y densidad.
+    feature_profile: str = "all"  # all | p0
 
     VALID_MODELS = (
         "graphsage",
@@ -95,6 +98,8 @@ class Config:
             raise ValueError("seed debe ser un entero")
         if self.device not in {"cpu", "cuda"}:
             raise ValueError("device debe ser 'cpu' o 'cuda'")
+        if self.feature_profile not in {"all", "p0"}:
+            raise ValueError("feature_profile debe ser 'all' o 'p0'")
 
     @classmethod
     def from_args(cls, args) -> "Config":
