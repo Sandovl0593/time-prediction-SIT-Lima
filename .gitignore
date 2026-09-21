@@ -5,3 +5,5 @@ __pycache__/
 **/processed/*/*.csv
 **/data/rawNYC/*.csv
 outputs/
+temp/
+tmp/

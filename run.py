@@ -12,6 +12,7 @@ import argparse
 import sys
 import os
 import json
+from pathlib import Path
 
 from src.main_process.general_pipeline import general_pipeline, load_processed_gdfs
 from src.main_process.visualizeNYC import visualize_segments_csv, visualize_nodes_edges
@@ -19,6 +20,7 @@ from src.train.trainer import train_and_evaluate
 from src.main_process.project_lima_times import project_lima_times
 from src.routes.lima_p0 import build_lima_p0_candidates
 from src.routes.evaluate_p0 import evaluate_predictions
+from src.routes.plot_lima_p0 import generate_p0_figures
 
 from src.config import Config
 
@@ -129,6 +131,8 @@ def main():
         report_path = os.path.join("src", "outputs", "lima", "p0_metrics.csv")
         pd.concat(p0_results, ignore_index=True).to_csv(report_path, index=False, float_format="%.6f")
         print(f"[run.py] Reporte P0 Lima: {report_path}")
+        figures = generate_p0_figures(Path("src") / "outputs")
+        print(f"[run.py] Figuras P0 Lima: {figures['scatter']}, {figures['bins']}, {figures['decomposition']}")
         return 0
 
     if args.model:

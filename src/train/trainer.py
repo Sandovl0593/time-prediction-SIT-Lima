@@ -597,7 +597,10 @@ def predict_routes(
 
         if not hop_pairs:
             pred_time = float("nan")
+            target_time = float("nan")
             covered = False
+            hop_times = []
+            hop_targets = []
         else:
             hop_times = []
             hop_targets = []
@@ -636,6 +639,12 @@ def predict_routes(
         row_out["has_target"] = not np.isnan(target_time) and not target_time == 0
         row_out["n_hops"] = len(hop_pairs)
         row_out["covered"] = covered
+        # Conservar la descomposición para verificar que cada predicción de
+        # ruta sea la suma de predicciones elementales, no otra estimación.
+        row_out["edge_predictions_s"] = _json.dumps(hop_times)
+        row_out["edge_targets_s"] = _json.dumps(hop_targets)
+        row_out["sum_edge_predictions_s"] = float(np.sum(hop_times)) if hop_times else float("nan")
+        row_out["sum_edge_targets_s"] = float(np.sum(hop_targets)) if hop_targets and all(t is not None for t in hop_targets) else float("nan")
         result_rows.append(row_out)
 
     all_routes_df = pd.DataFrame(result_rows)
