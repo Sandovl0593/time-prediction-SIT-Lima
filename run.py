@@ -14,12 +14,6 @@ import os
 import json
 from pathlib import Path
 
-from src.main_process.general_pipeline import general_pipeline, load_processed_gdfs
-from src.main_process.visualizeNYC import visualize_segments_csv, visualize_nodes_edges
-from src.train.trainer import train_and_evaluate
-from src.main_process.project_lima_times import project_lima_times
-from src.routes.lima_p0 import build_lima_p0_candidates
-from src.routes.evaluate_p0 import evaluate_predictions
 from src.routes.plot_lima_p0 import generate_p0_figures
 
 from src.config import Config
@@ -50,6 +44,14 @@ def parse_args():
         "--lima-p0",
         action="store_true",
         help="Generar etiquetas/rutas P0 de Lima y entrenar GAT y GATv2 sin curva ni densidad",
+    )
+    parser.add_argument(
+        "--report-p0",
+        action="store_true",
+        help=(
+            "Recalcular métricas, auditoría y figuras P0 desde "
+            "src/outputs/all_routes_gat.csv y all_routes_gatv2.csv, sin reentrenar"
+        ),
     )
 
     parser.add_argument(
@@ -99,6 +101,22 @@ def main():
     lima_graph_dir = os.path.join("src", "data", "processedLima")
     lima_p0_candidates = os.path.join("src", "outputs", "lima", "p0_route_candidates.csv")
 
+    if args.report_p0:
+        figures = generate_p0_figures(Path("src") / "outputs")
+        print("[run.py] Reporte P0 regenerado desde los CSV consolidados:")
+        for name, path in figures.items():
+            print(f"  {name}: {path}")
+        return 0
+
+    # Las demás acciones sí necesitan el stack geoespacial y de entrenamiento.
+    # Se importan después para que --report-p0 dependa solo de pandas/matplotlib.
+    from src.main_process.general_pipeline import general_pipeline, load_processed_gdfs
+    from src.main_process.visualizeNYC import visualize_segments_csv, visualize_nodes_edges
+    from src.train.trainer import train_and_evaluate
+    from src.main_process.project_lima_times import project_lima_times
+    from src.routes.lima_p0 import build_lima_p0_candidates
+    from src.routes.evaluate_p0 import evaluate_predictions
+
     if args.project_lima_times or args.lima_p0:
         projection = project_lima_times(
             lima_graph_dir,
@@ -110,6 +128,7 @@ def main():
         candidates = build_lima_p0_candidates(lima_graph_dir, lima_p0_candidates)
         print(f"[run.py] Rutas P0 Lima: {len(candidates)}")
         p0_results = []
+        p0_route_paths = {}
         for model_name in ("gat", "gatv2"):
             p0_config = Config(
                 model=model_name,
@@ -125,14 +144,19 @@ def main():
                 route_candidates_csv=lima_p0_candidates,
             )
             route_predictions = os.path.join(result["run_dir"], "route_predictions", "all_routes.csv")
+            p0_route_paths[model_name] = Path(route_predictions)
             p0_results.append(evaluate_predictions(route_predictions, model_name.upper()))
 
         import pandas as pd
         report_path = os.path.join("src", "outputs", "lima", "p0_metrics.csv")
         pd.concat(p0_results, ignore_index=True).to_csv(report_path, index=False, float_format="%.6f")
         print(f"[run.py] Reporte P0 Lima: {report_path}")
-        figures = generate_p0_figures(Path("src") / "outputs")
-        print(f"[run.py] Figuras P0 Lima: {figures['scatter']}, {figures['bins']}, {figures['decomposition']}")
+        figures = generate_p0_figures(
+            Path("src") / "outputs",
+            p0_route_paths["gat"],
+            p0_route_paths["gatv2"],
+        )
+        print(f"[run.py] Figuras P0 Lima: {figures['scatter']}, {figures['bins']}")
         return 0
 
     if args.model:

@@ -113,3 +113,26 @@ python run.py --model gat --hidden_dim 128 --num_layers 3 --lr 0.0005
 ## Métricas
 
 - MSE, RMSE, MAE, MAPE (%), R²
+
+## Reporte reproducible de P0
+
+Con `src/outputs/all_routes_gat.csv` y
+`src/outputs/all_routes_gatv2.csv` actualizados, el reporte completo se
+regenera sin entrenar nuevamente:
+
+```bash
+python run.py --report-p0
+```
+
+Para Lima, cada CSV conserva una sola orientación canónica por secuencia de
+nodos: una ruta y su reversa representan el mismo recorrido físico. El grafo
+procesado sigue la misma convención y serializa una sola arista no dirigida por
+tramo o transferencia.
+
+El comando valida que ambos modelos contengan las mismas rutas, comprueba que
+`pred` coincida con la suma de predicciones de aristas y escribe en
+`src/outputs/lima/` las métricas globales y por bin, los diagnósticos de
+residuales y los resultados por línea. Además construye rutas multi-línea con
+una sola transferencia de hasta 0.15 km, sin enumerar todas las permutaciones,
+y ejecuta tres experimentos de R² con submuestras estratificadas de 25, 50 y
+75 % para los conjuntos uni-línea y multi-línea.

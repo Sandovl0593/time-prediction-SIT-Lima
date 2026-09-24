@@ -51,11 +51,11 @@ def _normalise_station_name(value: object) -> str:
 
 
 def _add_transfer_edges(
-    graph: nx.MultiDiGraph,
+    graph: nx.MultiGraph,
     stations: pd.DataFrame,
     max_distance_m: float,
 ) -> int:
-    """Add bidirectional transfer edges between stations on different lines.
+    """Add one undirected transfer edge between stations on different lines.
 
     A pair is considered an interchange when it has an explicit transfer
     group, or when the stations lie within ``max_distance_m``.  A matching
@@ -132,17 +132,7 @@ def _add_transfer_edges(
                 "geometry": geometry,
             }
             graph.add_edge(first_id, second_id, **attributes)
-            graph.add_edge(
-                second_id,
-                first_id,
-                **{
-                    **attributes,
-                    "source_line": second_line,
-                    "target_line": first_line,
-                    "geometry": LineString(list(geometry.coords)[::-1]),
-                },
-            )
-            transfer_count += 2
+            transfer_count += 1
     return transfer_count
 
 
@@ -150,8 +140,14 @@ def build_lima_graph(
     stations_path: Path,
     output_dir: Path,
     transfer_distance_m: float = DEFAULT_TRANSFER_DISTANCE_M,
-) -> nx.MultiDiGraph:
-    """Crea un MultiDiGraph con aristas de línea y de transferencia."""
+) -> nx.MultiGraph:
+    """Crea un MultiGraph con una arista por tramo físico de Lima.
+
+    En este escenario las líneas 1--9 y el BRT tienen el mismo tiempo
+    proyectado en ambos sentidos y no existen servicios paralelos sobre un
+    mismo tramo como en la red de referencia de NYC. Por ello, ``u--v`` y
+    ``v--u`` representan la misma conexión y se serializan una sola vez.
+    """
     stations = pd.read_csv(stations_path, encoding="utf-8-sig")
     missing = REQUIRED_COLUMNS.difference(stations.columns)
     if missing:
@@ -166,7 +162,7 @@ def build_lima_graph(
     if stations["Station ID"].duplicated().any():
         raise ValueError("Station ID debe ser único para construir el grafo")
 
-    graph = nx.MultiDiGraph(name="Lima structural graph")
+    graph = nx.MultiGraph(name="Lima structural graph")
     for _, row in stations.iterrows():
         attributes = row.to_dict()
         station_id = str(attributes.pop("Station ID"))
@@ -203,18 +199,13 @@ def build_lima_graph(
                 "geometry": edge_geometry,
             }
             graph.add_edge(first_id, second_id, **edge_attributes)
-            graph.add_edge(
-                second_id,
-                first_id,
-                **{**edge_attributes, "geometry": LineString(list(edge_geometry.coords)[::-1])},
-            )
 
     _add_transfer_edges(graph, stations, transfer_distance_m)
     _save_graph(graph, stations, output_dir)
     return graph
 
 
-def _save_graph(graph: nx.MultiDiGraph, stations: pd.DataFrame, output_dir: Path) -> None:
+def _save_graph(graph: nx.MultiGraph, stations: pd.DataFrame, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     nodes = []
     for station_id, attributes in graph.nodes(data=True):

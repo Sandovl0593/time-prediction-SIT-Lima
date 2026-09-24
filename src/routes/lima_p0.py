@@ -23,15 +23,15 @@ def _nearest_bin(length_km: float) -> float:
 def _edge_lookup(edges: pd.DataFrame) -> dict[tuple[str, str], pd.Series]:
     lookup: dict[tuple[str, str], pd.Series] = {}
     for _, edge in edges.iterrows():
-        key = (str(edge["u"]), str(edge["v"]))
-        # The Lima structural graph has one directed edge per pair. Keep the
+        key = tuple(sorted((str(edge["u"]), str(edge["v"]))))
+        # Lima uses one undirected physical edge per station pair. Keep the
         # first one defensively if a future source emits parallel variants.
         lookup.setdefault(key, edge)
     return lookup
 
 
 def build_lima_p0_candidates(processed_dir: Path, output_path: Path) -> pd.DataFrame:
-    """Write bidirectional in-line multi-hop routes and one-hop transfers for P0."""
+    """Write one route per physical node sequence and one-hop transfer."""
     processed_dir = Path(processed_dir)
     nodes = pd.read_csv(processed_dir / "nodes.csv", low_memory=False)
     edges = pd.read_csv(processed_dir / "edges.csv", low_memory=False)
@@ -49,32 +49,34 @@ def build_lima_p0_candidates(processed_dir: Path, output_path: Path) -> pd.DataF
 
     for line, group in nodes.groupby("Line", sort=False):
         stop_ids = group.sort_values("Stop Sequence")["GTFS Stop ID"].astype(str).tolist()
-        for ordered_ids in (stop_ids, list(reversed(stop_ids))):
-            for first in range(len(ordered_ids) - 1):
-                for last in range(first + 1, len(ordered_ids)):
-                    hops = ordered_ids[first : last + 1]
-                    hop_edges = [lookup.get((hops[i], hops[i + 1])) for i in range(len(hops) - 1)]
-                    if any(edge is None for edge in hop_edges):
-                        continue
-                    length_m = float(sum(float(edge["length_m"]) for edge in hop_edges if edge is not None))
-                    target_s = float(sum(float(edge["travel_time_s"]) for edge in hop_edges if edge is not None))
-                    length_km = length_m / 1000.0
-                    bin_km = _nearest_bin(length_km)
-                    rows.append(
-                        {
-                            "scenario_id": "P0_Lima",
-                            "route_type": "in_line",
-                            "line": str(line),
-                            "start_stop_id": hops[0],
-                            "end_stop_id": hops[-1],
-                            "hops": json.dumps(hops),
-                            "n_hops": len(hops) - 1,
-                            "length_real_km": length_km,
-                            "tol_prox": bin_km,
-                            "km_offset": length_km - bin_km,
-                            "target": target_s,
-                        }
-                    )
+        for first in range(len(stop_ids) - 1):
+            for last in range(first + 1, len(stop_ids)):
+                hops = stop_ids[first : last + 1]
+                hop_edges = [
+                    lookup.get(tuple(sorted((hops[i], hops[i + 1]))))
+                    for i in range(len(hops) - 1)
+                ]
+                if any(edge is None for edge in hop_edges):
+                    continue
+                length_m = float(sum(float(edge["length_m"]) for edge in hop_edges if edge is not None))
+                target_s = float(sum(float(edge["travel_time_s"]) for edge in hop_edges if edge is not None))
+                length_km = length_m / 1000.0
+                bin_km = _nearest_bin(length_km)
+                rows.append(
+                    {
+                        "scenario_id": "P0_Lima",
+                        "route_type": "in_line",
+                        "line": str(line),
+                        "start_stop_id": hops[0],
+                        "end_stop_id": hops[-1],
+                        "hops": json.dumps(hops),
+                        "n_hops": len(hops) - 1,
+                        "length_real_km": length_km,
+                        "tol_prox": bin_km,
+                        "km_offset": length_km - bin_km,
+                        "target": target_s,
+                    }
+                )
 
     transfer_edges = edges[edge_type == "transfer"]
     for _, edge in transfer_edges.iterrows():

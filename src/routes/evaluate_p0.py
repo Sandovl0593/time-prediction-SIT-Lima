@@ -1,9 +1,8 @@
 """Calcula el reporte reproducible de la prueba P0 desde predicciones CSV.
 
 P0 evalúa la configuración base con las rutas que tienen simultáneamente
-objetivo y predicción cubiertos. El reporte separa la comparación directa
-target--pred por modelo y por bin de kilometraje, sin usar los indicadores de
-curvatura como sustituto de la evaluación predictiva.
+objetivo y predicción cubiertos. El reporte describe target--pred por modelo y
+por bin de kilometraje, sin usar indicadores de curvatura o densidad.
 """
 
 from __future__ import annotations
@@ -15,12 +14,23 @@ import numpy as np
 import pandas as pd
 
 
-REQUIRED_COLUMNS = {"target", "pred", "tol_prox", "has_target", "covered"}
+DEFAULT_GAT_PATH = Path("src/outputs/all_routes_gat.csv")
+DEFAULT_GATV2_PATH = Path("src/outputs/all_routes_gatv2.csv")
+DEFAULT_OUTPUT_PATH = Path("src/outputs/lima/p0_metrics.csv")
+REQUIRED_COLUMNS = {"target", "tol_prox", "has_target", "covered"}
 
 
-def _metrics(frame: pd.DataFrame) -> dict[str, float | int]:
+def _as_boolean(series: pd.Series) -> pd.Series:
+    """Interpret boolean CSV columns without treating the string 'False' as true."""
+    if pd.api.types.is_bool_dtype(series):
+        return series.fillna(False)
+    normalized = series.astype("string").str.strip().str.lower()
+    return normalized.isin({"true", "1", "yes", "si", "sí"})
+
+
+def _metrics(frame: pd.DataFrame, prediction_column: str = "pred") -> dict[str, float | int]:
     target = frame["target"].to_numpy(dtype=float)
-    prediction = frame["pred"].to_numpy(dtype=float)
+    prediction = frame[prediction_column].to_numpy(dtype=float)
     residual = prediction - target
     squared_error = float(np.square(residual).sum())
     target_variation = float(np.square(target - target.mean()).sum())
@@ -36,39 +46,71 @@ def _metrics(frame: pd.DataFrame) -> dict[str, float | int]:
     }
 
 
-def evaluate_predictions(predictions_path: Path, model: str) -> pd.DataFrame:
-    """Return global and per-bin P0 metrics for one model prediction file."""
-    data = pd.read_csv(predictions_path)
-    missing = REQUIRED_COLUMNS.difference(data.columns)
+def load_valid_predictions(
+    predictions_path: Path,
+    prediction_column: str = "pred",
+) -> pd.DataFrame:
+    """Load the covered P0 rows that have finite target and prediction values."""
+    predictions_path = Path(predictions_path)
+    data = pd.read_csv(predictions_path, low_memory=False)
+    missing = (REQUIRED_COLUMNS | {prediction_column}).difference(data.columns)
     if missing:
         raise ValueError(f"{predictions_path}: faltan columnas {sorted(missing)}")
 
+    target = pd.to_numeric(data["target"], errors="coerce")
+    prediction = pd.to_numeric(data[prediction_column], errors="coerce")
     valid = data.loc[
-        data["has_target"].fillna(False).astype(bool)
-        & data["covered"].fillna(False).astype(bool)
-        & data["target"].notna()
-        & data["pred"].notna()
+        _as_boolean(data["has_target"])
+        & _as_boolean(data["covered"])
+        & np.isfinite(target)
+        & np.isfinite(prediction)
     ].copy()
+    valid["target"] = target.loc[valid.index]
+    valid[prediction_column] = prediction.loc[valid.index]
     if valid.empty:
-        raise ValueError(f"{predictions_path}: no hay filas P0 con target y predicción cubiertos")
+        raise ValueError(
+            f"{predictions_path}: no hay filas P0 cubiertas con target y "
+            f"{prediction_column} finitos"
+        )
+    return valid
 
-    rows = [{"model": model, "bin_km": "global", **_metrics(valid)}]
+
+def evaluate_predictions(
+    predictions_path: Path,
+    model: str,
+    prediction_column: str = "pred",
+) -> pd.DataFrame:
+    """Return global and per-bin P0 metrics for one model prediction file."""
+    valid = load_valid_predictions(predictions_path, prediction_column)
+
+    rows = [{"model": model, "bin_km": "global", **_metrics(valid, prediction_column)}]
     for bin_km, group in valid.groupby("tol_prox", sort=True):
-        rows.append({"model": model, "bin_km": float(bin_km), **_metrics(group)})
+        rows.append(
+            {
+                "model": model,
+                "bin_km": float(bin_km),
+                **_metrics(group, prediction_column),
+            }
+        )
     return pd.DataFrame(rows)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gat", type=Path, required=True, help="CSV de predicciones GAT para P0")
-    parser.add_argument("--gatv2", type=Path, required=True, help="CSV de predicciones GATv2 para P0")
-    parser.add_argument("--output", type=Path, required=True, help="CSV de resumen que se generará")
+    parser.add_argument("--gat", type=Path, default=DEFAULT_GAT_PATH, help="CSV de rutas GAT para P0")
+    parser.add_argument("--gatv2", type=Path, default=DEFAULT_GATV2_PATH, help="CSV de rutas GATv2 para P0")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH, help="CSV de resumen que se generará")
+    parser.add_argument(
+        "--prediction-column",
+        default="pred",
+        help="Columna que se evaluará como predicción (por ejemplo, pred o sum_edge_predictions_s)",
+    )
     args = parser.parse_args()
 
     report = pd.concat(
         [
-            evaluate_predictions(args.gat, "GAT"),
-            evaluate_predictions(args.gatv2, "GATv2"),
+            evaluate_predictions(args.gat, "GAT", args.prediction_column),
+            evaluate_predictions(args.gatv2, "GATv2", args.prediction_column),
         ],
         ignore_index=True,
     )
